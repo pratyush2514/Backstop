@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { BackstopClient, scrubSecrets } from "@backstop/client";
+import { BackstopClient, ensureLocalRuntime, scrubSecrets } from "@backstop/client";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig, usage } from "./config.js";
 import { createBackstopMcpServer } from "./server.js";
@@ -11,10 +11,25 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+  const runtime =
+    config.backstopUrl
+      ? {
+          url: config.backstopUrl,
+          token: config.backstopToken,
+          agentId: config.agentId,
+        }
+      : await ensureLocalRuntime({
+          postgresUrl: config.backstopPostgresUrl,
+          agentId: config.agentId,
+          profile: config.profile,
+          runtimeVersion: config.runtimeVersion,
+          runtimeRepo: config.runtimeRepo,
+          mode: config.mode,
+        });
   const client = new BackstopClient({
-    url: config.backstopUrl,
-    token: config.backstopToken,
-    agentId: config.agentId,
+    url: runtime.url,
+    token: runtime.token,
+    agentId: runtime.agentId,
     timeoutMs: config.timeoutMs,
   });
   const server = createBackstopMcpServer(client, config);

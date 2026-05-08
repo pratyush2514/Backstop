@@ -58,8 +58,7 @@ safe database tool:
       "command": "npx",
       "args": ["@backstop/mcp-server"],
       "env": {
-        "BACKSTOP_URL": "http://localhost:8080",
-        "BACKSTOP_TOKEN": "dev-token",
+        "BACKSTOP_POSTGRES_URL": "postgresql://postgres:password@localhost:5432/app",
         "BACKSTOP_AGENT_ID": "cursor-local"
       }
     }
@@ -67,14 +66,18 @@ safe database tool:
 }
 ```
 
+In this managed local mode, `npx @backstop/mcp-server` bootstraps the local
+Backstop runtime for the user: gateway, sync sidecar, metadata DB, and a local
+S3-compatible snapshot store. Users do not need to start Docker or manually
+enter a `localhost` gateway URL in the normal MCP path.
+
 For custom Node agents, use `@backstop/client`:
 
 ```ts
 import { BackstopClient } from "@backstop/client";
 
-const backstop = new BackstopClient({
-  url: process.env.BACKSTOP_URL,
-  token: process.env.BACKSTOP_TOKEN,
+const backstop = await BackstopClient.local({
+  postgresUrl: process.env.POSTGRES_URL,
   agentId: process.env.BACKSTOP_AGENT_ID ?? "my-ai-agent",
 });
 

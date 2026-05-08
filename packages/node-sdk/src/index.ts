@@ -1,5 +1,13 @@
 export { BackstopClient, resolveAgentId } from "./client.js";
 export {
+  defaultBackstopHome,
+  ensureLocalRuntime,
+  minioDownloadUrl,
+  runtimeAssetName,
+  sanitizeProfile,
+  tokenForMode,
+} from "./runtime.js";
+export {
   BackstopApprovalRequiredError,
   BackstopAuthError,
   BackstopError,
@@ -14,6 +22,7 @@ export type {
   AnalyzeQueryOptions,
   AnalyzeQueryResult,
   AuditOptions,
+  BackstopLocalClientOptions,
   CollectionResponse,
   BackstopClientOptions,
   ExecuteQueryOptions,
@@ -25,4 +34,5 @@ export type {
   RiskLevel,
   SafetyMetadata,
 } from "./types.js";
+export type { BackstopClientMode, BackstopLocalRuntimeOptions, BackstopManagedRuntime } from "./runtime.js";
 

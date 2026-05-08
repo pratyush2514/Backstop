@@ -21,6 +21,20 @@ test("loadConfig resolves URL, token, agent id, timeout, and approval setting", 
   assert.equal(config.mode, "operator");
 });
 
+test("managed local mode resolves postgres url without requiring a gateway url", () => {
+  const config = loadConfig(
+    {
+      BACKSTOP_POSTGRES_URL: "postgresql://postgres:password@localhost:5432/app",
+      BACKSTOP_AGENT_ID: "cursor-agent",
+      BACKSTOP_PROFILE: "local-dev",
+    },
+    [],
+  );
+  assert.equal(config.backstopUrl, undefined);
+  assert.equal(config.backstopPostgresUrl, "postgresql://postgres:password@localhost:5432/app");
+  assert.equal(config.profile, "local-dev");
+});
+
 test("CLI args override env config", () => {
   const config = loadConfig(
     {
@@ -46,6 +60,7 @@ test("explicit MCP mode overrides legacy approval flag", () => {
     {
       BACKSTOP_MCP_ENABLE_APPROVAL_TOOLS: "true",
       BACKSTOP_MCP_MODE: "readonly",
+      BACKSTOP_POSTGRES_URL: "postgresql://postgres:password@localhost:5432/app",
     },
     [],
   );

@@ -3,10 +3,10 @@
 The recommended backstop journey is:
 
 ```text
-1. Start backstop gateway and sync sidecar.
-2. Configure the AI tool to use backstop MCP.
-3. Remove raw PostgreSQL credentials from the AI tool.
-4. Give the gateway the database credentials.
+1. Configure the AI tool to use backstop MCP.
+2. Give managed local mode the PostgreSQL connection string.
+3. Remove raw PostgreSQL credentials from the AI tool itself.
+4. Let backstop bootstrap the local runtime or attach to an existing one.
 5. Use audit, approval, metrics, and recovery readiness from backstop.
 ```
 
@@ -16,8 +16,8 @@ Correct:
 
 ```text
 AI agent has:
-- BACKSTOP_URL
-- BACKSTOP_TOKEN
+- BACKSTOP_POSTGRES_URL  (managed local mode), or:
+- BACKSTOP_URL + BACKSTOP_TOKEN  (existing runtime mode)
 - BACKSTOP_AGENT_ID
 
 backstop gateway has:

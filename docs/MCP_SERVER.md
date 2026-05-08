@@ -10,33 +10,29 @@ AI tool -> backstop MCP server -> backstop gateway -> PostgreSQL
 
 Do not give the AI tool raw PostgreSQL credentials. Give it backstop MCP access.
 
-## Local Development
+## Managed Local Mode
 
-Start the backstop backend:
-
-```powershell
-docker compose -f deploy\docker-compose.yml -p backstop_oss_e2e up -d --build
-```
-
-Build the MCP server:
+The default MCP happy path is managed local mode. The user only provides a
+PostgreSQL URL and an agent identity:
 
 ```powershell
-npm install
-npm run build --workspace @backstop/mcp-server
-```
-
-Run it over stdio:
-
-```powershell
-$env:BACKSTOP_URL = "http://localhost:8080"
-$env:BACKSTOP_TOKEN = "dev-token"
+$env:BACKSTOP_POSTGRES_URL = "postgresql://postgres:password@localhost:5432/app"
 $env:BACKSTOP_AGENT_ID = "cursor-local"
-npx backstop-mcp
+npx @backstop/mcp-server
 ```
 
-For a published release, the intended command is:
+On first run, the MCP package bootstraps the local Backstop runtime and reuses
+it on later runs. That includes the gateway, sync sidecar, SQLite metadata, and
+local S3-compatible snapshot storage used by the real recovery path.
+
+## Existing Runtime Mode
+
+If a team already runs Backstop elsewhere, MCP can attach to it explicitly:
 
 ```powershell
+$env:BACKSTOP_URL = "https://backstop.internal.example"
+$env:BACKSTOP_TOKEN = "operator-or-agent-token"
+$env:BACKSTOP_AGENT_ID = "cursor-local"
 npx @backstop/mcp-server
 ```
 
@@ -49,14 +45,16 @@ npx @backstop/mcp-server
       "command": "npx",
       "args": ["@backstop/mcp-server"],
       "env": {
-        "BACKSTOP_URL": "http://localhost:8080",
-        "BACKSTOP_TOKEN": "dev-token",
+        "BACKSTOP_POSTGRES_URL": "postgresql://postgres:password@localhost:5432/app",
         "BACKSTOP_AGENT_ID": "cursor-local"
       }
     }
   }
 }
 ```
+
+For an already-running Backstop deployment, replace `BACKSTOP_POSTGRES_URL` with
+`BACKSTOP_URL` and `BACKSTOP_TOKEN`.
 
 ## Where Does `BACKSTOP_AGENT_ID` Come From?
 

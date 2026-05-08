@@ -9,14 +9,18 @@ MCP server for using backstop as the database tool for AI agents.
       "command": "npx",
       "args": ["@backstop/mcp-server"],
       "env": {
-        "BACKSTOP_URL": "http://localhost:8080",
-        "BACKSTOP_TOKEN": "dev-token",
+        "BACKSTOP_POSTGRES_URL": "postgresql://postgres:password@localhost:5432/app",
         "BACKSTOP_AGENT_ID": "cursor-local"
       }
     }
   }
 }
 ```
+
+If `BACKSTOP_URL` is omitted, the MCP package starts and manages a local
+Backstop runtime automatically for that user. This keeps the real Backstop
+gateway/sync/recovery path intact without making the user manually start Docker
+or type a localhost gateway URL.
 
 `BACKSTOP_AGENT_ID` is not issued by backstop. It is a stable name chosen by the
 developer or operator so audit logs and approval screens can identify the

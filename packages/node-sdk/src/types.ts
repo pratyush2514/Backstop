@@ -11,6 +11,26 @@ export interface BackstopClientOptions {
   defaultHeaders?: Record<string, string>;
 }
 
+export interface BackstopLocalClientOptions {
+  postgresUrl?: string;
+  agentId?: string;
+  profile?: string;
+  homeDir?: string;
+  host?: string;
+  gatewayPort?: number;
+  syncMetricsPort?: number;
+  minioPort?: number;
+  minioConsolePort?: number;
+  storageBucket?: string;
+  startTimeoutMs?: number;
+  runtimeVersion?: string;
+  runtimeRepo?: string;
+  mode?: "agent" | "operator" | "readonly" | "admin";
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  defaultHeaders?: Record<string, string>;
+}
+
 export interface RequestOptions {
   timeoutMs?: number;
   signal?: AbortSignal;

@@ -13,6 +13,7 @@ import type {
   AnalyzeQueryOptions,
   AnalyzeQueryResult,
   AuditOptions,
+  BackstopLocalClientOptions,
   CollectionResponse,
   BackstopClientOptions,
   ExecuteQueryOptions,
@@ -21,6 +22,7 @@ import type {
   ListSnapshotsOptions,
   RequestOptions,
 } from "./types.js";
+import { ensureLocalRuntime } from "./runtime.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -32,6 +34,33 @@ export class BackstopClient {
 
   private readonly fetchImpl: typeof fetch;
   private readonly defaultHeaders: Record<string, string>;
+
+  static async local(options: BackstopLocalClientOptions = {}): Promise<BackstopClient> {
+    const runtime = await ensureLocalRuntime({
+      postgresUrl: options.postgresUrl,
+      agentId: options.agentId,
+      profile: options.profile,
+      homeDir: options.homeDir,
+      host: options.host,
+      gatewayPort: options.gatewayPort,
+      syncMetricsPort: options.syncMetricsPort,
+      minioPort: options.minioPort,
+      minioConsolePort: options.minioConsolePort,
+      storageBucket: options.storageBucket,
+      startTimeoutMs: options.startTimeoutMs,
+      runtimeVersion: options.runtimeVersion,
+      runtimeRepo: options.runtimeRepo,
+      mode: options.mode || "agent",
+    });
+    return new BackstopClient({
+      url: runtime.url,
+      token: runtime.token,
+      agentId: runtime.agentId,
+      timeoutMs: options.timeoutMs,
+      fetchImpl: options.fetchImpl,
+      defaultHeaders: options.defaultHeaders,
+    });
+  }
 
   constructor(options: BackstopClientOptions) {
     if (!options.url || !options.url.trim()) {

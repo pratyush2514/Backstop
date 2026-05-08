@@ -4,7 +4,11 @@ import {
   BackstopAuthError,
   BackstopClient,
   BackstopPolicyBlockedError,
+  minioDownloadUrl,
   resolveAgentId,
+  runtimeAssetName,
+  sanitizeProfile,
+  tokenForMode,
 } from "../dist/index.js";
 
 test("executeQuery builds JSON-RPC payload with bearer auth and agent id", async () => {
@@ -104,6 +108,26 @@ test("agent id resolves from explicit input, env, then local fallback", () => {
     process.env.BACKSTOP_AGENT_ID = previous;
   }
   assert.equal(resolveAgentId(), "backstop-node-agent");
+});
+
+test("runtime helper utilities normalize profile names and asset names", () => {
+  assert.equal(sanitizeProfile("local dev/profile"), "local-dev-profile");
+  assert.equal(runtimeAssetName("gateway", "win32", "x64"), "backstop-gateway-windows-amd64.exe");
+  assert.equal(runtimeAssetName("sync", "linux", "arm64"), "backstop-sync-linux-arm64");
+  assert.match(minioDownloadUrl("win32", "x64"), /windows-amd64\/minio\.exe$/);
+});
+
+test("mode-specific tokens choose the right local runtime token", () => {
+  const tokens = {
+    agent: "agent-token",
+    operator: "operator-token",
+    readonly: "readonly-token",
+    admin: "admin-token",
+  };
+  assert.equal(tokenForMode(tokens, "agent"), "agent-token");
+  assert.equal(tokenForMode(tokens, "operator"), "operator-token");
+  assert.equal(tokenForMode(tokens, "readonly"), "readonly-token");
+  assert.equal(tokenForMode(tokens, "admin"), "admin-token");
 });
 
 function jsonResponse(body, init = {}) {
