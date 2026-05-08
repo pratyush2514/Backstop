@@ -3,6 +3,7 @@ export {
   defaultBackstopHome,
   ensureLocalRuntime,
   minioDownloadUrl,
+  normalizeManagedPostgresUrl,
   runtimeAssetName,
   sanitizeProfile,
   tokenForMode,

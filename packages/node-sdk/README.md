@@ -13,6 +13,15 @@ const backstop = await BackstopClient.local({
 const result = await backstop.query("SELECT count(*) FROM users");
 ```
 
+For local PostgreSQL development on `localhost` / `127.0.0.1`, the managed
+runtime automatically adds `sslmode=disable` if you did not specify an
+`sslmode` already. That avoids the common "SSL is not enabled on the server"
+startup failure for default local Postgres installs.
+
+If the first managed-local startup fails, the thrown error includes the log
+path and the tail of the relevant runtime log so users do not have to guess
+which process failed.
+
 `agentId` is a stable identity chosen by the application developer. Use a value
 that lets operators recognize the caller in audit logs, approvals, and
 quarantine records, for example `cursor-local`, `codex-dev-agent`, or

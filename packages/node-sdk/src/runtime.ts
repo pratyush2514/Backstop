@@ -87,6 +87,12 @@ interface ResolvedRuntimeBinary {
   env?: NodeJS.ProcessEnv;
 }
 
+interface HealthWaitOptions {
+  serviceName: string;
+  logFile: string;
+  hint?: string;
+}
+
 export async function ensureLocalRuntime(options: BackstopLocalRuntimeOptions = {}): Promise<BackstopManagedRuntime> {
   const profile = sanitizeProfile(options.profile || process.env.BACKSTOP_PROFILE || "local");
   const paths = resolveRuntimePaths(options.homeDir, profile);
@@ -103,7 +109,9 @@ export async function ensureLocalRuntime(options: BackstopLocalRuntimeOptions = 
   const storageBucket = sanitizeBucket(options.storageBucket || process.env.BACKSTOP_BUCKET || `backstop-${profile}`);
   const runtimeVersion = options.runtimeVersion || process.env.BACKSTOP_RUNTIME_VERSION || packageVersion();
   const runtimeRepo = options.runtimeRepo || process.env.BACKSTOP_RUNTIME_REPO || DEFAULT_RUNTIME_REPO;
-  const postgresUrl = options.postgresUrl || process.env.BACKSTOP_POSTGRES_URL || process.env.BACKSTOP_DB_URL;
+  const postgresUrl = normalizeManagedPostgresUrl(
+    options.postgresUrl || process.env.BACKSTOP_POSTGRES_URL || process.env.BACKSTOP_DB_URL,
+  );
   const mode = options.mode || "agent";
   const agentId = (options.agentId || process.env.BACKSTOP_AGENT_ID || "backstop-local-agent").trim();
   const startTimeoutMs = parsePositiveInt(options.startTimeoutMs || process.env.BACKSTOP_RUNTIME_TIMEOUT_MS, DEFAULT_START_TIMEOUT_MS);
@@ -140,7 +148,11 @@ export async function ensureLocalRuntime(options: BackstopLocalRuntimeOptions = 
       },
     });
     await saveRuntimeState(paths.runtimeStateFile, state);
-    await waitFor(async () => minioHealthy(host, state.minioPort), startTimeoutMs, "timed out waiting for local MinIO");
+    await waitForHealth(async () => minioHealthy(host, state.minioPort), startTimeoutMs, {
+      serviceName: "local MinIO",
+      logFile: paths.minioLog,
+      hint: "Make sure the local runtime ports are free and the MinIO binary can start on this machine.",
+    });
   }
 
   await ensureBucketExists({
@@ -181,7 +193,12 @@ export async function ensureLocalRuntime(options: BackstopLocalRuntimeOptions = 
       },
     });
     await saveRuntimeState(paths.runtimeStateFile, state);
-    await waitFor(async () => gatewayHealthy(host, state.gatewayPort), startTimeoutMs, "timed out waiting for backstop gateway");
+    await waitForHealth(async () => gatewayHealthy(host, state.gatewayPort), startTimeoutMs, {
+      serviceName: "backstop gateway",
+      logFile: paths.gatewayLog,
+      hint:
+        "For local PostgreSQL, Backstop auto-adds sslmode=disable for localhost when you do not specify sslmode yourself. Verify the database exists and accepts local TCP connections.",
+    });
   }
 
   if (!(await syncHealthy(host, state.syncMetricsPort))) {
@@ -215,7 +232,11 @@ export async function ensureLocalRuntime(options: BackstopLocalRuntimeOptions = 
       },
     });
     await saveRuntimeState(paths.runtimeStateFile, state);
-    await waitFor(async () => syncHealthy(host, state.syncMetricsPort), startTimeoutMs, "timed out waiting for backstop sync");
+    await waitForHealth(async () => syncHealthy(host, state.syncMetricsPort), startTimeoutMs, {
+      serviceName: "backstop sync",
+      logFile: paths.syncLog,
+      hint: "If the gateway started but sync did not, check the sync log for database/storage startup errors.",
+    });
   }
 
   return {
@@ -255,6 +276,30 @@ export function tokenForMode(tokens: Record<string, string>, mode: BackstopClien
     default:
       return tokens.agent;
   }
+}
+
+export function normalizeManagedPostgresUrl(value: string | undefined): string | undefined {
+  if (!value || !value.trim()) {
+    return value;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return value;
+  }
+
+  if (!/^postgres(ql)?:$/i.test(parsed.protocol)) {
+    return value;
+  }
+  if (!isLocalDbHost(parsed.hostname)) {
+    return value;
+  }
+  if (!parsed.searchParams.has("sslmode")) {
+    parsed.searchParams.set("sslmode", "disable");
+  }
+  return parsed.toString();
 }
 
 export function runtimeAssetName(service: "gateway" | "sync", platform = process.platform, arch = process.arch): string {
@@ -521,7 +566,7 @@ async function launchProcess(options: {
   return child.pid;
 }
 
-async function waitFor(check: () => Promise<boolean>, timeoutMs: number, message: string): Promise<void> {
+async function waitForHealth(check: () => Promise<boolean>, timeoutMs: number, options: HealthWaitOptions): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (await check()) {
@@ -529,7 +574,7 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs: number, message
     }
     await sleep(750);
   }
-  throw new BackstopTimeoutError(message);
+  throw new BackstopTimeoutError(await startupFailureMessage(options));
 }
 
 async function runCommand(
@@ -601,6 +646,20 @@ function packageVersion(): string {
   return "0.1.0-alpha.1";
 }
 
+async function startupFailureMessage(options: HealthWaitOptions): Promise<string> {
+  const details = [`timed out waiting for ${options.serviceName} to become healthy`];
+  const logTail = await readLogTail(options.logFile);
+  if (logTail) {
+    details.push(`log tail from ${options.logFile}:\n${logTail}`);
+  } else {
+    details.push(`check ${options.logFile} for startup details`);
+  }
+  if (options.hint) {
+    details.push(options.hint);
+  }
+  return details.join("\n\n");
+}
+
 function platformLabel(platform: NodeJS.Platform): string {
   switch (platform) {
     case "win32":
@@ -633,6 +692,21 @@ function minioArch(arch: string): string {
       return "arm64";
     default:
       throw new BackstopError(`unsupported architecture for managed local runtime: ${arch}`);
+  }
+}
+
+function isLocalDbHost(hostname: string): boolean {
+  const normalized = (hostname || "").trim().toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+async function readLogTail(file: string, maxChars = 4000): Promise<string> {
+  try {
+    const text = await readFile(file, "utf8");
+    const trimmed = text.trim();
+    return trimmed ? trimmed.slice(-maxChars) : "";
+  } catch {
+    return "";
   }
 }
 

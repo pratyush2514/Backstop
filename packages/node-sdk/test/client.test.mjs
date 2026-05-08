@@ -5,6 +5,7 @@ import {
   BackstopClient,
   BackstopPolicyBlockedError,
   minioDownloadUrl,
+  normalizeManagedPostgresUrl,
   resolveAgentId,
   runtimeAssetName,
   sanitizeProfile,
@@ -128,6 +129,25 @@ test("mode-specific tokens choose the right local runtime token", () => {
   assert.equal(tokenForMode(tokens, "operator"), "operator-token");
   assert.equal(tokenForMode(tokens, "readonly"), "readonly-token");
   assert.equal(tokenForMode(tokens, "admin"), "admin-token");
+});
+
+test("managed local postgres URLs auto-disable ssl only for local hosts without explicit sslmode", () => {
+  assert.equal(
+    normalizeManagedPostgresUrl("postgresql://postgres:password@localhost:5432/app"),
+    "postgresql://postgres:password@localhost:5432/app?sslmode=disable",
+  );
+  assert.equal(
+    normalizeManagedPostgresUrl("postgresql://postgres:password@127.0.0.1:5432/app?connect_timeout=5"),
+    "postgresql://postgres:password@127.0.0.1:5432/app?connect_timeout=5&sslmode=disable",
+  );
+  assert.equal(
+    normalizeManagedPostgresUrl("postgresql://postgres:password@localhost:5432/app?sslmode=require"),
+    "postgresql://postgres:password@localhost:5432/app?sslmode=require",
+  );
+  assert.equal(
+    normalizeManagedPostgresUrl("postgresql://postgres:password@db.internal:5432/app"),
+    "postgresql://postgres:password@db.internal:5432/app",
+  );
 });
 
 function jsonResponse(body, init = {}) {
