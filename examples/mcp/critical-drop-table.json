@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "execute_query",
+    "arguments": {
+      "agent_id": "demo-agent",
+      "query": "DROP TABLE audit_logs",
+      "snapshot_id": "replace-with-latest-snapshot-id"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backstop"
+version = "0.1.0"
+description = "Production-grade database safety platform — intercept, snapshot, recover"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.11"
+dependencies = [
+    "sqlglot>=23.0.0",
+    "psycopg2-binary>=2.9.0",
+    "pyarrow>=14.0.0",
+    "boto3>=1.34.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "moto[s3]>=5.0.0",
+]
+
+[project.scripts]
+backstop = "backstop.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/pratyush2514/Backstop"
+Repository = "https://github.com/pratyush2514/Backstop.git"
+Issues = "https://github.com/pratyush2514/Backstop/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backstop*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests that require live Docker services (Postgres + MinIO)",
+]
+

@@ -1,0 +1,24 @@
+{
+  "tokens": [
+    {
+      "name": "agent-local",
+      "token": "replace-agent-token",
+      "scopes": ["query:analyze", "query:execute"]
+    },
+    {
+      "name": "operator-local",
+      "token": "replace-operator-token",
+      "scopes": ["approval:read", "approval:write", "metadata:read"]
+    },
+    {
+      "name": "prometheus-local",
+      "token": "replace-metrics-token",
+      "scopes": ["metrics:read"]
+    },
+    {
+      "name": "admin-local",
+      "token": "replace-admin-token",
+      "scopes": ["admin:*"]
+    }
+  ]
+}

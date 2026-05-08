@@ -1,0 +1,112 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-testdb}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./seed.sql:/seed/seed.sql:ro
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+  create-bucket:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}; do sleep 2; done &&
+      mc mb --ignore-existing local/${BACKSTOP_BUCKET:-backstop-test}
+      "
+
+  backstop-sync:
+    image: ${BACKSTOP_SYNC_IMAGE:-ghcr.io/pratyush2514/backstop-sync:${BACKSTOP_VERSION:-latest}}
+    depends_on:
+      - postgres
+      - minio
+      - create-bucket
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - backstop-metadata:/metadata
+    command:
+      - --db
+      - ${BACKSTOP_DB_URL:-postgresql://postgres:password@postgres:5432/testdb?sslmode=disable}
+      - --storage
+      - ${BACKSTOP_STORAGE:-s3://backstop-test@http://minio:9000}
+      - --interval
+      - ${BACKSTOP_SYNC_INTERVAL:-30}
+      - --schema
+      - ${BACKSTOP_SCHEMA:-public}
+      - --metadata-db
+      - /metadata/backstop.db
+      - --metrics-listen
+      - :9091
+      - --max-snapshot-age
+      - ${BACKSTOP_MAX_SNAPSHOT_AGE:-5m}
+      - --bypass-detection=${BACKSTOP_BYPASS_DETECTION:-true}
+      - --agent-roles
+      - ${BACKSTOP_AGENT_ROLES:-postgres}
+      - --gateway-application-name
+      - backstop-gateway
+    ports:
+      - "${BACKSTOP_SYNC_METRICS_PORT:-9091}:9091"
+
+  backstop-gateway:
+    image: ${BACKSTOP_GATEWAY_IMAGE:-ghcr.io/pratyush2514/backstop-gateway:${BACKSTOP_VERSION:-latest}}
+    depends_on:
+      - postgres
+      - minio
+      - create-bucket
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      BACKSTOP_GATEWAY_AUDIT_LOG: /data/audit.jsonl
+      BACKSTOP_ENVIRONMENT: ${BACKSTOP_ENVIRONMENT:-local}
+      BACKSTOP_CLUSTER_ID: ${BACKSTOP_CLUSTER_ID:-local}
+    volumes:
+      - gateway-audit:/data
+      - backstop-metadata:/metadata
+      - ./gateway-auth-tokens.json:/config/gateway-auth-tokens.json:ro
+    command:
+      - --listen
+      - :8080
+      - --db
+      - ${BACKSTOP_GATEWAY_DB_URL:-postgresql://postgres:password@postgres:5432/testdb?sslmode=disable&application_name=backstop-gateway}
+      - --storage
+      - ${BACKSTOP_STORAGE:-s3://backstop-test@http://minio:9000}
+      - --snapshot-before-critical=true
+      - --auth-tokens-file
+      - /config/gateway-auth-tokens.json
+      - --audit-log
+      - /data/audit.jsonl
+      - --metadata-db
+      - /metadata/backstop.db
+      - --environment
+      - ${BACKSTOP_ENVIRONMENT:-local}
+      - --cluster-id
+      - ${BACKSTOP_CLUSTER_ID:-local}
+    ports:
+      - "${BACKSTOP_GATEWAY_PORT:-8080}:8080"
+
+volumes:
+  postgres-data:
+  minio-data:
+  gateway-audit:
+  backstop-metadata:
+

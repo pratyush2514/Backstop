@@ -1,0 +1,20 @@
+{
+  "require_approval_for_risks": ["HIGH", "IMPACT_CRITICAL", "CRITICAL"],
+  "block_operations": ["DROP DATABASE", "DROP SCHEMA"],
+  "require_recovery_for_critical": true,
+  "block_unknown_or_parse_failure": true,
+  "block_unrecoverable_operations": true,
+  "max_snapshot_age_seconds": 300,
+  "require_sidecar_heartbeat": true,
+  "max_sidecar_heartbeat_seconds": 120,
+  "impact_analysis_enabled": true,
+  "max_write_rows_without_critical": 1000,
+  "max_write_percent_without_critical": 25,
+  "protected_tables": [],
+  "protected_columns": {},
+  "unknown_impact_action": "approve",
+  "recovery_groups": {},
+  "max_blocked_attempts_per_window": 3,
+  "quarantine_duration_seconds": 1800,
+  "dangerous_retry_window_seconds": 600
+}

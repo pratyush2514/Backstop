@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "execute_query",
+    "arguments": {
+      "agent_id": "demo-agent",
+      "query": "DROP DATABASE testdb"
+    }
+  }
+}
+
