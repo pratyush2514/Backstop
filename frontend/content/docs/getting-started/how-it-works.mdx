@@ -1,0 +1,128 @@
+---
+title: How it works
+description: A technical walkthrough of Backstop's four-layer safety model — from query interception through snapshot capture, policy enforcement, and bypass detection.
+---
+
+import { Callout, Steps, Step, RiskBadge } from "@/components/docs/mdx-components";
+
+Every query that passes through Backstop follows the same deterministic path. Understanding this path is important because it defines exactly what Backstop guarantees — and where it cannot help you.
+
+## The query lifecycle
+
+```
+Agent                  Gateway                   Database
+  │                      │                           │
+  │── execute_query ──►  │                           │
+  │                      │── Parse SQL (AST) ──►     │
+  │                      │── Classify risk ──►       │
+  │                      │── Check policy ──►        │
+  │                      │                           │
+  │                      │  if CRITICAL:             │
+  │                      │── Verify latest snapshot ►│ (S3 / metadata)
+  │                      │                           │
+  │                      │  if policy = BLOCK:        │
+  │◄── blocked ─────────│                           │
+  │                      │                           │
+  │                      │  if policy = APPROVE:     │
+  │◄── approval_required │                           │
+  │                      │ (waits for operator)      │
+  │                      │                           │
+  │                      │  if policy = EXECUTE:     │
+  │                      │── Execute on DB ─────────►│
+  │◄── result ───────────│◄── rows/command ──────────│
+  │                      │── Audit event logged       │
+```
+
+## Layer 1 — SQL parsing and classification
+
+Backstop uses a real PostgreSQL-dialect SQL parser, not regex. Every query is parsed into an Abstract Syntax Tree (AST), and the operation type, target schema, target table, and estimated impact are extracted.
+
+The result is one of five risk levels:
+
+| Level | Examples | Default action |
+|---|---|---|
+| <RiskBadge level="SAFE" /> | SELECT, SHOW, SET, EXPLAIN | Execute immediately |
+| <RiskBadge level="HIGH" /> | INSERT, UPDATE/DELETE with WHERE, most DDL | Require approval |
+| <RiskBadge level="LOW" /> | Reserved for local SDK / compatibility flows | Depends on integration path |
+| <RiskBadge level="IMPACT_CRITICAL" /> | Writes affecting > N rows or > X% of table | Require approval + snapshot |
+| <RiskBadge level="CRITICAL" /> | DROP TABLE, TRUNCATE, unscoped DELETE/UPDATE | Require verified recovery point + approval |
+
+Parse failures and unknown SQL are treated as `CRITICAL` by default (`block_unknown_or_parse_failure: true`). Nothing gets through on ambiguity.
+
+## Layer 2 — Policy enforcement
+
+After classification, the query is matched against your policy file. The policy defines:
+
+- Which risk levels require human approval before execution
+- Which operations are blocked outright (DROP DATABASE, DROP SCHEMA)
+- Whether a verified snapshot must exist before a CRITICAL operation can be approved
+- Impact analysis thresholds (max rows, max percentage of table)
+- Protected tables and columns that trigger extra scrutiny
+
+The policy decision produces one of three outcomes:
+
+- **execute** — query proceeds immediately
+- **approval_required** — gateway holds the query and returns an `approval_id` to the caller
+- **block** — query is rejected, never reaches the database
+
+## Layer 3 — Recovery readiness gate
+
+Before a `CRITICAL` operation can be approved (even by an operator), Backstop verifies:
+
+1. A recent snapshot of the target table exists in S3/MinIO
+2. The snapshot is recent enough (configurable max age, default 5 minutes)
+3. The sync sidecar heartbeat is healthy (default max 2 minutes old)
+4. The snapshot manifest and object checks pass validation when enabled
+
+If any of these checks fail, the operation is blocked even with operator approval. This ensures you always have a verified recovery path before destruction can proceed.
+
+<Callout type="warning" title="Snapshot age matters">
+  If your sync sidecar hasn't run recently (due to a restart, network issue, or storage problem), CRITICAL operations will be blocked even if the operator wants to allow them. This is intentional — it ensures you can always recover.
+</Callout>
+
+## Layer 4 — Bypass detection
+
+Backstop polls `pg_stat_activity` in your PostgreSQL instance to detect agents connecting directly to the database, bypassing the gateway. If a direct connection is detected:
+
+1. An alert is generated and stored
+2. Backstop's prevention posture is marked as **degraded** (recovery-only mode)
+3. Prometheus metrics are updated
+
+This matters because if an agent has direct database credentials, Backstop cannot intercept its queries. Bypass detection surfaces this gap so you can respond.
+
+<Callout type="danger" title="Bypass is a credential problem">
+  The root fix for bypass is **never giving AI agents direct PostgreSQL credentials**. Agents should only receive the Backstop gateway URL and a scoped token. See the [Credential Model](/docs/security/credential-model) guide.
+</Callout>
+
+## The sync sidecar
+
+The sync sidecar runs as a separate process (or container) alongside the gateway. Its jobs:
+
+- **Continuous table snapshots** — captures configured tables as Parquet files to S3/MinIO on a configurable interval
+- **Manifest generation** — writes checksummed manifests so snapshot integrity can be verified
+- **Heartbeat reporting** — reports liveness to the gateway so the recovery gate can verify it
+- **Bypass monitoring** — polls `pg_stat_activity` and generates alerts
+
+The sidecar is stateless except for the SQLite metadata store it shares with the gateway. It can be restarted safely at any time.
+
+## Metadata and state
+
+All operational state — audit events, approvals, snapshots, alerts, health records — is stored in a local SQLite database (`backstop.db`). SQLite uses WAL mode and busy timeouts so the gateway and sidecar can safely share it without locking issues.
+
+This means:
+
+- No external database required to run Backstop
+- State is portable and inspectable with standard SQLite tools
+- For production, back up `backstop.db` alongside your data snapshots
+
+## What happens when things fail
+
+| Failure | Backstop behavior |
+|---|---|
+| Gateway crash | Agent queries fail closed — no pass-through to DB |
+| Sidecar crash | CRITICAL operations blocked (heartbeat gone stale) |
+| S3 unavailable | CRITICAL operations blocked (snapshot can't be verified) |
+| SQLite unavailable | Gateway refuses all queries |
+| Parse failure | Query treated as CRITICAL (blocked or requires approval) |
+
+Backstop is designed to fail closed. When in doubt, it blocks.

@@ -1,0 +1,273 @@
+---
+title: Runbooks
+description: Step-by-step procedures for common operational scenarios — pauses, restores, approval backlogs, and incident response.
+---
+
+import { Callout, Steps, Step } from "@/components/docs/mdx-components";
+
+These runbooks cover the most common operational scenarios. Keep this page bookmarked and accessible before an incident occurs.
+
+---
+
+## Emergency pause
+
+Use when you observe suspicious agent behavior, runaway queries, or any situation where you need to stop all writes immediately.
+
+<Steps>
+
+<Step>
+
+### Pause the gateway
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer bsp_admin_token" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Suspicious agent behavior — investigating"}' \
+  http://localhost:8080/admin/pause
+```
+
+After pausing: all WRITE, HIGH, and CRITICAL queries are rejected. SELECT (SAFE) queries continue.
+
+</Step>
+
+<Step>
+
+### Verify the pause took effect
+
+```bash
+curl -H "Authorization: Bearer bsp_admin_token" \
+  http://localhost:8080/admin/status
+```
+
+Look for `"paused": true` in the response.
+
+</Step>
+
+<Step>
+
+### Investigate
+
+Check the audit log for the triggering event:
+
+```bash
+curl -H "Authorization: Bearer bsp_ops_token" \
+  "http://localhost:8080/metadata/audit?limit=50&risk=CRITICAL"
+```
+
+Check alerts:
+
+```bash
+curl -H "Authorization: Bearer bsp_ops_token" \
+  http://localhost:8080/metadata/alerts
+```
+
+</Step>
+
+<Step>
+
+### Resume when safe
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer bsp_admin_token" \
+  http://localhost:8080/admin/resume
+```
+
+</Step>
+
+</Steps>
+
+---
+
+## Restore a table from snapshot
+
+Use after a destructive query executed — whether accidental or approved.
+
+<Steps>
+
+<Step>
+
+### Find the right snapshot
+
+```bash
+backstop snapshots list \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --table users
+```
+
+Note the `snapshot_id` of the snapshot taken **before** the destructive operation.
+
+</Step>
+
+<Step>
+
+### Dry run first
+
+```bash
+backstop restore \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --snapshot-id snap_a3f9e2c1 \
+  --table users \
+  --dry-run
+```
+
+The dry run verifies the manifest checksum and reports what would be written. Always run this first.
+
+</Step>
+
+<Step>
+
+### Execute the restore
+
+```bash
+backstop restore \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --snapshot-id snap_a3f9e2c1 \
+  --table users
+```
+
+The restore is transactional — it truncates the table and re-inserts from the Parquet file in a single transaction.
+
+</Step>
+
+<Step>
+
+### Verify row counts
+
+```bash
+psql postgresql://postgres@localhost:5432/mydb \
+  -c "SELECT count(*) FROM users"
+```
+
+Compare against the row count in the snapshot manifest.
+
+</Step>
+
+</Steps>
+
+<Callout type="warning" title="Rows written after the snapshot are lost">
+  A snapshot restore replaces the table with the state at snapshot time. Any rows written between the snapshot and the restore are lost. If you need finer-grained recovery, use PITR.
+</Callout>
+
+---
+
+## Point-in-time recovery (PITR)
+
+Use when the destructive operation happened between snapshots or when you need sub-second precision.
+
+<Steps>
+
+<Step>
+
+### Identify the target time
+
+Find the timestamp just before the incident from the audit log:
+
+```bash
+curl -H "Authorization: Bearer bsp_ops_token" \
+  "http://localhost:8080/metadata/audit?limit=100" | jq '.[] | select(.risk_level == "CRITICAL")'
+```
+
+</Step>
+
+<Step>
+
+### Prepare the restore
+
+```bash
+backstop pitr prepare-restore \
+  --storage s3://prod-snapshots \
+  --cluster-id prod \
+  --backup-id backup_2026-05-06 \
+  --target-dir /var/lib/postgresql/pitr-restore \
+  --target-time "2026-05-06 12:29:00+00"
+```
+
+This downloads WAL files and writes `recovery.conf` into the target directory.
+
+</Step>
+
+<Step>
+
+### Start a recovery instance
+
+Point a PostgreSQL instance at the target directory and start it. It will replay WAL up to the target time and then pause in recovery mode.
+
+Verify the recovery completed to the right point:
+
+```bash
+psql postgresql://postgres@localhost:5433/mydb \
+  -c "SELECT pg_last_xact_replay_timestamp()"
+```
+
+</Step>
+
+<Step>
+
+### Promote or export
+
+Either promote the recovery instance to take over, or export specific tables back to production:
+
+```bash
+pg_dump -t users postgresql://postgres@localhost:5433/mydb | \
+  psql postgresql://postgres@localhost:5432/mydb
+```
+
+</Step>
+
+</Steps>
+
+---
+
+## Clear an approval backlog
+
+When a large number of queries are awaiting approval (for example, after a policy change), process them in bulk.
+
+```bash
+# List all pending
+curl -H "Authorization: Bearer bsp_ops_token" \
+  http://localhost:8080/pending | jq '.pending[] | {id, sql, risk_level, agent_id}'
+
+# Approve by ID
+curl -X POST \
+  -H "Authorization: Bearer bsp_ops_token" \
+  http://localhost:8080/approve/appr_4f9e2c1a
+
+# Deny by ID
+curl -X POST \
+  -H "Authorization: Bearer bsp_ops_token" \
+  http://localhost:8080/deny/appr_4f9e2c1a
+```
+
+For bulk operations, use a script:
+
+```bash
+# Approve all pending from a specific agent
+curl -H "Authorization: Bearer bsp_ops_token" http://localhost:8080/pending \
+  | jq -r '.pending[] | select(.agent_id == "cursor-local") | .id' \
+  | while read id; do
+      curl -s -X POST \
+        -H "Authorization: Bearer bsp_ops_token" \
+        "http://localhost:8080/approve/$id"
+      echo "Approved $id"
+    done
+```
+
+---
+
+## Sidecar not heartbeating
+
+When `/metadata/health` shows `sidecar_status: "stale"` or `sidecar_heartbeat_age_seconds > 120`.
+
+1. Check sidecar logs: `docker logs backstop-sidecar` or `journalctl -u backstop-sidecar`
+2. Verify sidecar can reach the gateway: `curl http://<gateway>/health` from sidecar host
+3. Check S3 connectivity from sidecar: `backstop doctor storage-permissions --storage s3://...`
+4. Restart sidecar: `docker restart backstop-sidecar`
+
+<Callout type="info">
+  Snapshots are not being taken while the sidecar is down. The gateway continues to operate, but new CRITICAL queries will use the last available snapshot. Consider pausing writes until the sidecar recovers.
+</Callout>

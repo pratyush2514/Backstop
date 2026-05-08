@@ -1,0 +1,170 @@
+---
+title: Approval workflow
+description: How Backstop holds destructive queries for operator review, the approval lifecycle, and how agents and operators communicate through the approval API.
+---
+
+import { Callout, Steps, Step, ApiMethod } from "@/components/docs/mdx-components";
+
+When a query is classified at a risk level that requires approval (configurable, default: HIGH, IMPACT_CRITICAL, CRITICAL), Backstop holds execution and waits for an operator decision. The agent is notified via the query response, and the operator approves or denies via the API.
+
+## The approval lifecycle
+
+```
+Agent submits query
+       │
+       ▼
+Gateway classifies: CRITICAL
+       │
+       ▼
+Snapshot captured (if CRITICAL)
+       │
+       ▼
+Gateway returns approval_required
+  { approval_id: "appr_xxx", snapshot_id: "snap_xxx" }
+       │
+       ▼
+Operator reviews via /pending
+       │
+   ┌───┴───┐
+   ▼       ▼
+Approve  Deny
+   │       │
+   ▼       ▼
+Agent  Agent receives
+polls  denied response
+   │
+   ▼
+Agent resubmits with snapshot_id
+       │
+       ▼
+Gateway verifies snapshot, executes
+```
+
+## Step-by-step
+
+<Steps>
+  <Step title="Agent submits the query">
+    The agent sends a query through the SDK or JSON-RPC API. The gateway classifies it and, if approval is required, responds immediately with:
+
+    ```json
+    {
+      "status": "approval_required",
+      "risk_level": "CRITICAL",
+      "approval_id": "appr_4f9e2c1a",
+      "snapshot_id": "snap_a3f9",
+      "message": "Query requires operator approval. Snapshot captured."
+    }
+    ```
+
+    The agent should store the `approval_id` and `snapshot_id` for later.
+  </Step>
+
+  <Step title="Operator reviews pending approvals">
+    The operator (a human or automation with approval scope) polls the pending approvals endpoint:
+
+    ```bash
+    curl -H "Authorization: Bearer operator-token" \
+      http://localhost:8080/pending
+    ```
+
+    Response:
+    ```json
+    {
+      "pending": [
+        {
+          "id": "appr_4f9e2c1a",
+          "agent_id": "cursor-local",
+          "sql": "DROP TABLE users",
+          "risk_level": "CRITICAL",
+          "snapshot_id": "snap_a3f9",
+          "snapshot_age_seconds": 45,
+          "created_at": "2026-05-06T10:30:00Z"
+        }
+      ]
+    }
+    ```
+  </Step>
+
+  <Step title="Operator approves or denies">
+    ```bash
+    # Approve
+    curl -X POST -H "Authorization: Bearer operator-token" \
+      http://localhost:8080/approve/appr_4f9e2c1a
+
+    # Deny
+    curl -X POST -H "Authorization: Bearer operator-token" \
+      http://localhost:8080/deny/appr_4f9e2c1a
+    ```
+  </Step>
+
+  <Step title="Agent resubmits (if approved)">
+    Once approved, the agent resubmits the query. For CRITICAL operations, the `snapshot_id` must be included so the gateway can verify recovery readiness:
+
+    **Python SDK:**
+    ```python
+    # The SDK handles resubmission automatically after approval
+    # You can also pass snapshot_id explicitly:
+    db.execute("DROP TABLE users", snapshot_id="snap_a3f9")
+    ```
+
+    **Node.js SDK:**
+    ```typescript
+    await backstop.executeQuery("DROP TABLE users", {
+      snapshotId: "snap_a3f9",
+    });
+    ```
+
+    **JSON-RPC:**
+    ```json
+    {
+      "jsonrpc": "2.0",
+      "method": "tools/call",
+      "params": {
+        "name": "execute_query",
+        "arguments": {
+          "query": "DROP TABLE users",
+          "snapshot_id": "snap_a3f9",
+          "agent_id": "cursor-local",
+          "db_url": "postgresql://..."
+        }
+      }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Approval API reference
+
+<ApiMethod method="GET" path="/pending" auth="approval:read scope">
+  Returns all pending approvals awaiting a decision. Sorted by creation time, oldest first.
+</ApiMethod>
+
+<ApiMethod method="POST" path="/approve/{id}" auth="approval:write scope">
+  Approves a pending query. The agent can now resubmit with the associated snapshot_id. Returns 200 on success, 404 if the approval ID is not found.
+</ApiMethod>
+
+<ApiMethod method="POST" path="/deny/{id}" auth="approval:write scope">
+  Denies a pending query. The query is permanently rejected. Returns 200 on success.
+</ApiMethod>
+
+## Quarantine
+
+Backstop tracks how many times an agent submits queries that are blocked or denied within a configurable time window. If the count exceeds `max_blocked_attempts_per_window`, the agent is quarantined:
+
+- All future queries from that agent are rejected until the quarantine expires
+- A quarantine alert is generated
+- The quarantine duration is configurable (`quarantine_duration_seconds`)
+
+```json
+{
+  "max_blocked_attempts_per_window": 3,
+  "quarantine_duration_seconds": 1800,
+  "dangerous_retry_window_seconds": 600
+}
+```
+
+This prevents an agent from repeatedly probing for approval on the same destructive query, or from trying to find a path through policy by slight SQL variations.
+
+<Callout type="info" title="Approval timeout">
+  Approvals do not expire automatically. If you need time-limited approvals, implement a cron job that calls the deny endpoint for approvals older than your threshold. This is intentional — a missed approval window should not silently expire and re-allow the operation.
+</Callout>

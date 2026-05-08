@@ -1,0 +1,194 @@
+---
+title: Troubleshooting
+description: Diagnosis and fixes for the most common Backstop issues.
+---
+
+import { Callout } from "@/components/docs/mdx-components";
+
+---
+
+## Gateway won't start
+
+**Symptom:** `backstop-gateway` exits immediately or fails to bind.
+
+**Check 1 — Port in use**
+
+```bash
+# macOS / Linux
+lsof -i :8080
+
+# Windows
+netstat -ano | findstr :8080
+```
+
+Change the port with `BACKSTOP_PORT=8081`.
+
+**Check 2 — Database unreachable**
+
+```bash
+psql $BACKSTOP_DB_URL -c "SELECT 1"
+```
+
+The gateway exits if it can't connect to the database on startup.
+
+**Check 3 — Token file missing or malformed**
+
+```bash
+cat $BACKSTOP_TOKENS | python3 -m json.tool
+```
+
+The token file must be valid JSON and contain an array of token objects.
+
+---
+
+## `401 Unauthorized` on every request
+
+The bearer token is missing, misspelled, or not in the token file.
+
+```bash
+# Verify the token file contains the token you're using
+cat $BACKSTOP_TOKENS | jq '.[] | .token'
+
+# Test directly
+curl -H "Authorization: Bearer your_token_here" http://localhost:8080/health
+```
+
+Note: `/health` does not require authentication — if this 401s, check the header syntax. Use `Bearer <token>`, not `Token <token>` or `Basic <token>`.
+
+---
+
+## `403 Forbidden` — insufficient_scope
+
+Your token exists but lacks the required scope for the endpoint.
+
+```json
+{
+  "error": "insufficient_scope",
+  "message": "Token does not have approval:write scope",
+  "required_scope": "approval:write"
+}
+```
+
+Add the required scope to the token in your `tokens.json` file and restart the gateway, or use a different token that already has the scope.
+
+---
+
+## execute_query returns `blocked` unexpectedly
+
+Check `safety_metadata.policy_reason` in the response — it explains exactly why the query was blocked.
+
+Common causes:
+
+| Cause | Fix |
+|---|---|
+| Table is in `protected_tables` | Intended — this table requires extra protection |
+| Query matches a blocked operation type | Check `BACKSTOP_POLICY_*` environment variables |
+| `parse_error_present: true` | Backstop couldn't parse the SQL — simplify the query or check for syntax errors |
+| Bulk operation exceeds threshold | `affected_percent` is too high — add a WHERE clause to narrow scope |
+
+---
+
+## execute_query always returns `approval_required`
+
+**If this is expected** — your policy is set to `approve` for the risk level. An operator needs to approve via `POST /approve/{id}`.
+
+**If this is unexpected** — check:
+
+```bash
+# What policies are active?
+curl -H "Authorization: Bearer admin-token" \
+  http://localhost:8080/admin/status | jq '.policy'
+```
+
+Adjust policy with environment variables:
+
+```bash
+BACKSTOP_POLICY_HIGH=execute   # Don't require approval for HIGH
+BACKSTOP_POLICY_CRITICAL=approve  # Require approval for CRITICAL only
+```
+
+---
+
+## Sidecar shows `stale` in health check
+
+```json
+{
+  "sidecar_status": "stale",
+  "sidecar_heartbeat_age_seconds": 450
+}
+```
+
+The sidecar hasn't checked in for more than 120 seconds.
+
+1. Check sidecar is running: `docker ps | grep sidecar` or `systemctl status backstop-sidecar`
+2. Check sidecar logs for errors: `docker logs backstop-sidecar --tail 50`
+3. Verify sidecar can reach gateway: `curl http://<gateway>:8080/health` from sidecar host
+4. Check S3 write permissions: `backstop doctor storage-permissions --storage s3://your-bucket`
+
+---
+
+## `last_snapshot_age_seconds` is growing
+
+The sidecar is running but not producing new snapshots.
+
+1. Check sidecar logs for snapshot errors
+2. Verify S3 bucket has write space (MinIO: check disk, S3: check bucket policy)
+3. Check if a large snapshot is in progress — it may take several minutes for wide tables
+
+```bash
+curl -H "Authorization: Bearer ops-token" \
+  "http://localhost:8080/metadata/snapshots?table=users" | jq '.[0]'
+```
+
+---
+
+## Restore fails with checksum mismatch
+
+```
+Error: manifest checksum mismatch — snapshot may be corrupted
+```
+
+The Parquet file in S3 doesn't match the checksum stored in the manifest. Possible causes:
+
+- File was manually modified in S3
+- Partial upload (network issue during snapshot)
+- S3 bucket has object mutation enabled
+
+Try the previous snapshot:
+
+```bash
+backstop snapshots list --table users --storage s3://...
+# Use the next-oldest snapshot_id
+backstop restore --snapshot-id snap_previous --table users --dry-run
+```
+
+---
+
+## High query latency through the gateway
+
+Backstop adds classification overhead on every query. Expected overhead is 5–15ms for simple queries. If you're seeing much higher latency:
+
+1. **Check gateway host resources** — CPU/memory on the gateway process
+2. **Check database connectivity** — `pg_stat_activity` for connection wait states
+3. **Check snapshot sidecar impact** — Snapshots briefly lock tables; don't schedule them during peak load windows
+4. **Check policy evaluation** — Complex policy rules add evaluation time
+
+```bash
+# Check Prometheus metrics for gateway processing time
+curl http://localhost:8080/metrics | grep backstop_query_duration
+```
+
+---
+
+## Dev token active in production
+
+```bash
+curl http://your-production-gateway/health \
+  -H "Authorization: Bearer dev-token"
+```
+
+If this returns 200, `BACKSTOP_DEV_MODE=true` is set in your production environment. Remove it immediately and restart the gateway.
+
+<Callout type="danger">
+  The dev-token grants full access to everything. If it's active in production, any system that knows the URL can execute arbitrary SQL against your database.
+</Callout>

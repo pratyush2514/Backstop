@@ -1,0 +1,172 @@
+---
+title: MCP Server
+description: Configure the Backstop MCP server for Claude Desktop, Cursor, and any MCP-compatible AI client — with tool reference and mode definitions.
+---
+
+import { Callout, PropertyTable, Terminal } from "@/components/docs/mdx-components";
+
+The Backstop MCP server exposes the gateway's capabilities as Model Context Protocol tools. Any MCP-compatible AI client can use it to execute or review SQL safely through Backstop's interception layer, depending on the MCP mode you choose.
+
+## Installation
+
+```bash
+npm install -g @backstop/mcp-server
+# or use npx without installing:
+npx @backstop/mcp-server
+```
+
+## Modes
+
+The MCP server runs in one of four modes that determine which tools are available:
+
+| Mode | Available tools | Use case |
+|---|---|---|
+| `agent` | execute, analyze, list_snapshots, get_safety_status, get_audit, get_alerts | Standard AI agent access |
+| `operator` | analyze, list_snapshots, get_safety_status, get_pending_approvals, get_audit_events, get_alerts, approve, deny | Human operators reviewing approvals |
+| `readonly` | analyze, list_snapshots, get_safety_status, get_audit, get_alerts | Read-only audit and inspection |
+| `admin` | all operator tools + execute, pause, resume, get_admin_status | Emergency response and admin |
+
+## Claude Desktop configuration
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "backstop": {
+      "command": "npx",
+      "args": ["@backstop/mcp-server"],
+      "env": {
+        "BACKSTOP_URL": "http://localhost:8080",
+        "BACKSTOP_TOKEN": "your-agent-token",
+        "BACKSTOP_AGENT_ID": "claude-desktop",
+        "BACKSTOP_MCP_MODE": "agent"
+      }
+    }
+  }
+}
+```
+
+## Cursor configuration
+
+Add to `.cursor/mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "backstop": {
+      "command": "npx",
+      "args": ["@backstop/mcp-server"],
+      "env": {
+        "BACKSTOP_URL": "http://localhost:8080",
+        "BACKSTOP_TOKEN": "your-agent-token",
+        "BACKSTOP_AGENT_ID": "cursor-local",
+        "BACKSTOP_MCP_MODE": "agent"
+      }
+    }
+  }
+}
+```
+
+## Environment variables
+
+<PropertyTable properties={[
+  { name: "BACKSTOP_URL", type: "string", required: true, description: "Base URL of the Backstop gateway." },
+  { name: "BACKSTOP_TOKEN", type: "string", required: true, description: "Bearer token for authentication. Use an agent-scoped token." },
+  { name: "BACKSTOP_AGENT_ID", type: "string", required: true, description: "Stable identifier for this MCP client. Used for attribution in audit logs." },
+  { name: "BACKSTOP_MCP_MODE", type: "string", required: false, default: '"agent"', description: "Server mode: agent, operator, readonly, or admin." }
+]} />
+
+## Tool reference
+
+### backstop_execute_query
+
+Executes SQL through the Backstop gateway. CRITICAL table operations require a latest sidecar `snapshot_id` and may require approval. `DROP DATABASE` and `DROP SCHEMA` are blocked.
+
+**Input schema:**
+```json
+{
+  "query": "SELECT * FROM users WHERE id = 5",
+  "snapshot_id": "snap_a3f9"
+}
+```
+
+**Returns:** Full query result including `status`, `risk_level`, `safety_metadata`, `rows`, and `approval_id` if approval is needed.
+
+---
+
+### backstop_analyze_query
+
+Classifies SQL without executing it. Use this before submitting a write operation to understand the risk.
+
+**Input schema:**
+```json
+{ "query": "DELETE FROM payments WHERE user_id = 99" }
+```
+
+**Returns:** `risk_level`, `safety_metadata` with full classification detail.
+
+---
+
+### backstop_list_snapshots
+
+Lists available recovery snapshots.
+
+**Input schema:**
+```json
+{ "table": "users" }
+```
+
+---
+
+### backstop_get_safety_status
+
+Returns a summary of gateway health, recent alerts, and pending approvals. The recommended first call for any AI agent session.
+
+---
+
+### backstop_get_pending_approvals *(operator/admin mode)*
+
+Lists pending approval requests.
+
+---
+
+### backstop_get_audit_events
+
+Reads audit events, optionally filtered by `agent_id` or risk.
+
+---
+
+### backstop_get_alerts
+
+Reads alert metadata from the gateway and sidecar.
+
+---
+
+### backstop_approve_query *(operator/admin mode)*
+
+Approves a pending query by approval ID.
+
+**Input schema:**
+```json
+{ "approval_id": "appr_4f9e2c1a" }
+```
+
+---
+
+### backstop_pause_gateway *(admin mode)*
+
+Emergency pause — stops all writes and critical query execution.
+
+**Input schema:**
+```json
+{ "reason": "Suspicious agent behavior" }
+```
+
+### backstop_resume_gateway *(admin mode)*
+
+Resumes execution after an emergency pause.
+
+<Callout type="info" title="Agent ID best practice">
+  Set `BACKSTOP_AGENT_ID` to a value that identifies both the tool and the user, such as `cursor-pratyush-dev`. This makes audit logs readable and enables per-agent quarantine to work correctly.
+</Callout>

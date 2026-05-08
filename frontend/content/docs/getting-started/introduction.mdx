@@ -1,0 +1,72 @@
+---
+title: Introduction
+description: Backstop is an open-source PostgreSQL safety gateway and recovery layer for AI-driven SQL.
+---
+
+import { Callout } from "@/components/docs/mdx-components";
+
+Backstop sits between your AI tool and PostgreSQL when queries are routed through it. It classifies SQL before execution, applies policy, requires approval for risky operations, verifies recovery readiness for destructive table-level actions, and gives you fast restore paths using your own storage and metadata.
+
+<Callout type="info" title="Origin">
+  Backstop was built after an AI agent deleted an entire production database in 9 seconds during a coding session. The incident made clear that the standard tools — backups, PITR, snapshots — were not fast or granular enough to prevent the real cost: the lost data, the trust, the recovery time.
+</Callout>
+
+## What Backstop does
+
+**Intercepts before execution.** SQL is parsed by a real AST parser — not regex. The operation type, target table, row estimate, and impact are classified before a single row is touched.
+
+**Recovery readiness before destructive execution.** For table-level `CRITICAL` operations, Backstop verifies that a recent sidecar snapshot exists in your object storage and binds approved execution to that recovery point. If you allow the operation, you have a restore path ready. If you block it, nothing reaches the database.
+
+**Enforces policy.** You define what requires approval, what is blocked outright, and what requires a verified snapshot before proceeding. Policy is a JSON file you control. No vendor lock-in, no runtime config service.
+
+**Audits gateway activity.** Every query routed through the gateway is logged with its classification, the agent that submitted it, the policy decision, and any recovery metadata used. You have a durable operational record for the protected path.
+
+**Detects bypass.** If an agent connects to the database directly and bypasses the gateway, Backstop detects it via `pg_stat_activity` polling and alerts immediately.
+
+## Who it's for
+
+Backstop is designed for **teams that give AI agents database access**. This includes:
+
+- Developers using Cursor, Claude, or any agent with SQL tools
+- Teams deploying LangChain, LlamaIndex, or OpenAI function-calling against production databases
+- Platform engineers who need auditable guardrails without changing agent code
+- Anyone who has asked "what if the agent deletes the wrong table?"
+
+## How it's not like standard backups
+
+| | Standard backups | PITR | Backstop |
+|---|---|---|---|
+| **Recovery granularity** | Full DB | Point in time | Per-table, per-operation |
+| **Recovery time** | Hours | Hours | Minutes for supported table restores |
+| **Pre-execution gate** | No | No | Yes |
+| **Approval workflow** | No | No | Yes |
+| **Agent attribution** | No | No | Yes |
+| **Real-time detection** | No | No | Yes |
+
+Standard backups and PITR are **recovery tools**. Backstop is a **prevention and fast-recovery tool**. You should run both.
+
+## Architecture overview
+
+Backstop has four components:
+
+1. **Gateway** — parses, classifies, enforces policy, routes approvals, and verifies recovery readiness.
+2. **Sync sidecar** — continuously snapshots tables to S3/MinIO as Parquet, reports health, and monitors bypass.
+3. **Python CLI / SDK** — handles restore, drills, and local interception for psycopg2 or SQLAlchemy.
+4. **Node.js SDK / MCP server** — for TypeScript agents and MCP-compatible clients.
+
+All state (audit events, approvals, snapshots, alerts) is stored in a local SQLite database. No cloud service required.
+
+## What Backstop cannot do
+
+Be honest with yourself about the limits:
+
+- It **cannot** protect against a DROP DATABASE or DROP SCHEMA (no pre-op snapshot is possible for these)
+- It **cannot** enforce protection if an agent holds direct PostgreSQL credentials
+- It **cannot** replace PITR for full-cluster disasters — use both
+- Snapshot consistency is **per-table** — cross-table transactional consistency requires recovery groups
+
+Read the [Limitations](/docs/concepts/safety-model#limitations) section before going to production.
+
+## Next step
+
+Follow the [Quick Start](/docs/getting-started/quick-start) to have Backstop running and protecting a local database in under 5 minutes.

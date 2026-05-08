@@ -1,0 +1,123 @@
+---
+title: Security boundaries
+description: What Backstop protects against, what it doesn't, and where the trust boundaries sit in a deployed system.
+---
+
+import { Callout } from "@/components/docs/mdx-components";
+
+## Threat model
+
+Backstop is designed to protect against one specific threat: **an AI agent issuing unintended or malicious SQL queries against a production database**.
+
+This includes:
+
+- Accidental bulk deletes from a poorly scoped WHERE clause
+- Destructive schema changes (DROP TABLE, TRUNCATE) triggered without intent
+- Data exfiltration via unbounded SELECT queries on sensitive tables
+- Agent prompt injection leading to attacker-controlled SQL
+- Runaway migrations or automation that modify more data than intended
+
+---
+
+## What Backstop protects
+
+### Against agents
+
+- Queries routed through the gateway are classified before execution
+- CRITICAL operations require human approval before they execute
+- Agents cannot approve their own queries (scope separation enforces this)
+- Every query is logged with agent ID, SQL, risk level, and policy decision
+- Tables and columns can be marked protected — any query touching them is rated CRITICAL
+
+### Against accidents
+
+- Snapshot capture before CRITICAL operations gives you a recovery point
+- The emergency pause stops gateway-mediated writes via a single API call
+- Estimated affected row counts and percentages are included in the policy decision
+- A bulk DELETE with no WHERE clause on a large table is flagged CRITICAL regardless of intent
+
+### Against configuration drift
+
+- The production checklist surfaces misconfiguration before go-live
+- `backstop doctor` validates external dependencies (tools, S3 permissions) on demand
+- Health endpoint reports sidecar liveness and snapshot freshness continuously
+
+---
+
+## What Backstop does not protect against
+
+<Callout type="warning">
+  Understanding these boundaries is as important as understanding what Backstop does protect. Don't rely on Backstop for threats it doesn't address.
+</Callout>
+
+### Direct database access
+
+Backstop protects only queries routed through the gateway. If an agent, script, or user connects to the database directly (bypassing the gateway), those queries are completely invisible to Backstop.
+
+**Mitigation:** Restrict database network access to the gateway's IP/host only. No other system should be able to reach port 5432.
+
+### SELECT query data exfiltration
+
+Backstop classifies SELECT queries as SAFE (for simple reads) or flags them if they touch protected columns. It does not inspect query results or limit the volume of data returned. A SELECT * FROM users without a LIMIT will execute if the table isn't protected.
+
+**Mitigation:** Mark sensitive tables as protected. Use `protected_columns` for specific fields. Implement row-level security in PostgreSQL for fine-grained control.
+
+### Compromised operator token
+
+If an attacker gains control of an `approval:write` token, they can approve any pending query — including destructive ones. Backstop cannot distinguish a legitimate operator approval from a compromised one.
+
+**Mitigation:** Store operator tokens in a secrets manager. Use short-lived tokens with rotation. Require MFA for access to the approval interface.
+
+### Compromised admin token
+
+The admin token can pause, resume, and execute arbitrary queries. A compromised admin token is equivalent to direct database access.
+
+**Mitigation:** Store the admin token in a hardware security module or secrets manager. Use it only for break-glass scenarios. Audit all admin token usage via Prometheus/audit log.
+
+### Gateway process compromise
+
+If the gateway process itself is compromised (e.g., via a vulnerability in the gateway binary), the attacker has access to the database credentials in process memory.
+
+**Mitigation:** Run the gateway in a minimal container with no shell access. Apply OS-level process isolation. Keep the gateway binary updated.
+
+### SQL injection via agent_id
+
+The `agent_id` field in `execute_query` is logged as-is. If an attacker controls an agent's `agent_id` value, they can inject misleading strings into the audit log.
+
+**Mitigation:** Validate `agent_id` values at the token level — associate each token with an expected agent ID in your token file.
+
+---
+
+## Trust boundary diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  UNTRUSTED                                                  │
+│                                                             │
+│   AI Agent  ──── execute_query (token: query:execute) ──►  │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│  BACKSTOP GATEWAY (classification + policy + gating)        │
+│                                                             │
+│   ◄── approve/deny (token: approval:write) ── Operator      │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│  TRUSTED                                                    │
+│                                                             │
+│   PostgreSQL database                                       │
+│   S3 snapshot storage                                       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The gateway is the only component that crosses between untrusted (agent) and trusted (database) zones. Agents never have direct access to the trusted zone.
+
+---
+
+## Compliance notes
+
+Backstop's audit log (accessible via `/metadata/audit`) produces a durable record of gateway activity, including blocked and denied queries. This can support internal review and evidence collection, but Backstop alone does not make you compliant with any framework.
+
+<Callout type="info">
+  Backstop's audit log records intent and policy decisions, not query results. It does not store the data returned by SELECT queries — only metadata about the query itself.
+</Callout>

@@ -1,0 +1,171 @@
+---
+title: LangChain
+description: Use Backstop as a SafeDatabaseTool in LangChain agents — drop-in replacement for SQLDatabaseToolkit.
+---
+
+import { Callout, Steps, Step, Tabs, Tab } from "@/components/docs/mdx-components";
+
+LangChain agents that query databases typically use `SQLDatabaseToolkit`. Backstop replaces direct database access with a safety-gated wrapper that classifies every query before execution.
+
+## Install
+
+```bash
+pip install langchain langchain-openai langchain-community backstop
+```
+
+## Quick example
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_react_agent, AgentExecutor
+from backstop import BackstopTool
+
+tool = BackstopTool(
+    gateway_url="http://localhost:8080",
+    token="bsp_agent_your_token_here",
+    agent_id="langchain-prod",
+)
+
+llm = ChatOpenAI(model="gpt-4o")
+agent = create_react_agent(llm, [tool], prompt=...)
+executor = AgentExecutor(agent=agent, tools=[tool], verbose=True)
+
+result = executor.invoke({"input": "How many users signed up last week?"})
+```
+
+The agent uses Backstop's `execute_query` tool transparently. It never connects to the database directly.
+
+## BackstopTool reference
+
+```python
+from backstop import BackstopTool
+
+tool = BackstopTool(
+    gateway_url="http://localhost:8080",   # Backstop gateway URL
+    token="bsp_agent_...",                  # Agent bearer token
+    agent_id="langchain-prod",             # Identifies this agent in audit logs
+    db_url=None,                           # Override gateway's default DB (optional)
+    timeout=30,                            # Request timeout in seconds
+)
+```
+
+`BackstopTool` extends `langchain_core.tools.BaseTool` and implements `_run()` / `_arun()`.
+
+## Async support
+
+Use `_arun()` (called automatically by async agent runtimes):
+
+```python
+import asyncio
+from langchain.agents import create_react_agent
+from langchain_openai import ChatOpenAI
+from backstop import BackstopTool
+
+async def main():
+    tool = BackstopTool(
+        gateway_url="http://localhost:8080",
+        token="bsp_agent_token",
+        agent_id="langchain-async",
+    )
+    # async executor usage
+    result = await tool.arun("SELECT count(*) FROM orders WHERE status = 'pending'")
+    print(result)
+
+asyncio.run(main())
+```
+
+## Handling approval_required
+
+When the agent issues a CRITICAL query, it receives an `approval_required` response. LangChain agents surface this to the user via the agent's reasoning trace. Configure your agent to pause and wait:
+
+```python
+from backstop import BackstopTool, ApprovalRequiredError
+
+tool = BackstopTool(
+    gateway_url="http://localhost:8080",
+    token="bsp_agent_token",
+    agent_id="langchain-prod",
+    raise_on_approval_required=True,  # Raises instead of returning approval_required
+)
+
+try:
+    result = executor.invoke({"input": "Drop the temp_imports table"})
+except ApprovalRequiredError as e:
+    print(f"Approval needed: {e.approval_id}")
+    print(f"Snapshot: {e.snapshot_id}")
+    # Notify operator, wait, then resubmit with snapshot_id
+```
+
+## Custom agent prompt
+
+Tell the agent about Backstop's response format so it handles approvals gracefully:
+
+```python
+from langchain_core.prompts import PromptTemplate
+
+SYSTEM = """You are a database assistant with access to execute_query.
+
+When execute_query returns status=approval_required, tell the user:
+"This query requires operator approval (ID: {approval_id}). I'll wait."
+
+When execute_query returns status=blocked, explain the policy reason
+from safety_metadata.policy_reason and suggest a safer alternative.
+
+Never attempt to bypass the gateway or connect to the database directly.
+"""
+```
+
+## Production pattern: read-only agent + human-in-the-loop writes
+
+A common pattern is to give the LangChain agent full read access while routing writes to a human-in-the-loop flow:
+
+```python
+from backstop import BackstopTool
+
+# Read-only agent: only analyze, never execute
+read_tool = BackstopTool(
+    gateway_url="http://localhost:8080",
+    token="bsp_readonly_token",  # query:analyze scope only
+    agent_id="analyst-bot",
+)
+
+# Write agent: executes through gateway (requires approval for HIGH/CRITICAL)
+write_tool = BackstopTool(
+    gateway_url="http://localhost:8080",
+    token="bsp_write_token",     # query:execute scope
+    agent_id="migration-bot",
+)
+```
+
+<Callout type="info" title="Audit trail">
+  Every query the LangChain agent issues — including the ones it decides not to run — appears in the Backstop audit log tagged with the `agent_id`. This gives you a full trace of agent activity without modifying LangChain internals.
+</Callout>
+
+## Using without the Python SDK
+
+If you prefer to call Backstop directly (without installing the SDK), construct the JSON-RPC call manually:
+
+```python
+import httpx
+
+def execute_query(query: str, agent_id: str) -> dict:
+    resp = httpx.post(
+        "http://localhost:8080",
+        headers={"Authorization": "Bearer bsp_agent_token"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "execute_query",
+                "arguments": {
+                    "query": query,
+                    "agent_id": agent_id,
+                }
+            }
+        }
+    )
+    return resp.json()["result"]
+```
+
+Then wrap this in a `@tool`-decorated function for LangChain.

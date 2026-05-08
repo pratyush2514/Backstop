@@ -1,0 +1,164 @@
+---
+title: Cursor
+description: Connect Backstop to Cursor through MCP so SQL goes through the safety gateway instead of raw database credentials.
+---
+
+import { Callout, Steps, Step, Tabs, Tab } from "@/components/docs/mdx-components";
+
+Cursor is one of the most common AI coding environments where agents issue database queries directly. Backstop integrates via the MCP protocol — Cursor's built-in tool-calling layer.
+
+## How it works
+
+When you add Backstop as an MCP server, Cursor's AI gains access to Backstop tools such as `backstop_execute_query` and `backstop_analyze_query`. SQL goes through Backstop first — classified, gated, and logged — before touching your database.
+
+```
+Cursor AI → MCP tool call → Backstop gateway → PostgreSQL
+```
+
+The AI never connects to your database directly.
+
+## Prerequisites
+
+- Backstop gateway running (see [Quick start](/docs/getting-started/quick-start))
+- Cursor version 0.40 or later
+- A bearer token for the agent (see [Authentication](/docs/api-reference/authentication))
+
+## Setup
+
+<Steps>
+
+<Step>
+
+### Start Backstop
+
+```bash
+backstop-oss up
+```
+
+Verify it's running:
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok"}
+```
+
+</Step>
+
+<Step>
+
+### Add the MCP server to Cursor
+
+Open Cursor settings (`Cmd+Shift+J` on Mac, `Ctrl+Shift+J` on Windows), navigate to **MCP**, and add:
+
+```json
+{
+  "mcpServers": {
+    "backstop": {
+      "command": "npx",
+      "args": ["@backstop/mcp-server"],
+      "env": {
+        "BACKSTOP_URL": "http://localhost:8080",
+        "BACKSTOP_TOKEN": "your-agent-token",
+        "BACKSTOP_AGENT_ID": "cursor-local",
+        "BACKSTOP_MCP_MODE": "agent"
+      }
+    }
+  }
+}
+```
+
+Alternatively, edit `~/.cursor/mcp.json` directly.
+
+</Step>
+
+<Step>
+
+### Confirm the tools are available
+
+In a Cursor chat, ask:
+
+> What database tools do you have available?
+
+Cursor should report Backstop tools such as `backstop_execute_query` and `backstop_analyze_query`. If it doesn't, restart Cursor and verify the gateway URL is reachable.
+
+</Step>
+
+<Step>
+
+### Test with a safe query
+
+Ask Cursor:
+
+> Run: SELECT count(*) FROM users
+
+You should see `execute_query` called in the tool call panel, and the result returned. Check the audit log:
+
+```bash
+curl -H "Authorization: Bearer bsp_ops_token" \
+  "http://localhost:8080/metadata/audit?limit=5"
+```
+
+</Step>
+
+</Steps>
+
+## Agent ID
+
+By default, you should set an explicit `BACKSTOP_AGENT_ID` for Cursor, such as `cursor-pratyush-dev`. You can also override `agent_id` per tool call when needed:
+
+```bash
+BACKSTOP_AGENT_ID=cursor-pratyush-dev
+```
+
+The `agent_id` appears in all audit events and approval requests.
+
+## What the AI sees
+
+Backstop returns full `safety_metadata` with every response, including the risk level and policy reason. Cursor's AI model can read this context and explain decisions to you:
+
+```
+execute_query returned:
+  status: approval_required
+  risk_level: CRITICAL
+  message: CRITICAL operation requires operator approval. Snapshot captured.
+  approval_id: appr_4f9e2c1a
+```
+
+The AI will typically tell you what happened and ask if you want to proceed through the approval flow.
+
+## Approval flow with Cursor
+
+When a query requires approval:
+
+1. Cursor shows the `approval_required` response with an `approval_id`
+2. You (or an operator) approve it via the REST API or operator MCP mode
+3. You ask Cursor to resubmit — it includes the same verified `snapshot_id` to satisfy the gateway
+
+```
+You: Go ahead and resubmit that DROP TABLE
+Cursor: [calls execute_query with snapshot_id: "snap_a3f9e2c1"]
+```
+
+<Callout type="warning" title="Never give Cursor approval:write">
+  The agent token should only have `query:execute` and `query:analyze` scopes. If the agent could approve its own queries, Backstop's safety model would be defeated. Approvals must come from a separate operator token.
+</Callout>
+
+## Troubleshooting
+
+**Cursor can't connect to the gateway**
+
+Check that the gateway is running and the port is reachable:
+
+```bash
+curl http://localhost:8080/health
+```
+
+If running in Docker, ensure the container port is mapped and Cursor can reach the host network.
+
+**Tools not appearing in Cursor**
+
+Restart Cursor after editing `mcp.json`. The MCP server list is loaded at startup.
+
+**`401 Unauthorized` errors**
+
+Verify the token in `mcp.json` matches one in your `tokens.json` file. Tokens are case-sensitive.

@@ -1,0 +1,99 @@
+---
+title: Safety model
+description: Backstop's four-layer defense model — parsing, policy, recovery readiness, and bypass detection — and the honest guarantees each layer provides.
+---
+
+import { Callout, RiskBadge } from "@/components/docs/mdx-components";
+
+Backstop's safety model is layered. No single mechanism is sufficient. Each layer addresses a different failure mode, and understanding what each layer does — and does not — guarantee is essential before deploying in production.
+
+## Layer 1 — Parse-time classification
+
+Every SQL statement is parsed by a PostgreSQL-dialect AST parser before execution. The parser extracts:
+
+- **Operation type** — SELECT, INSERT, UPDATE, DELETE, DROP, TRUNCATE, DDL, etc.
+- **Target table** — the schema and table name affected
+- **Scope indicator** — whether a WHERE clause is present for writes
+- **Parse confidence** — whether the SQL was understood without error
+
+Parse failures are fail-closed: unknown or unparseable SQL is treated as `CRITICAL` by default. This means that SQL injection attempts or unusual syntax don't slip through — they get blocked or queued for approval.
+
+<Callout type="info">
+  Backstop does not use regex to classify SQL. Pattern matching breaks on parameterized queries, comments, and obfuscation. AST parsing is deterministic for any valid PostgreSQL statement.
+</Callout>
+
+## Layer 2 — Policy enforcement
+
+Classification alone does nothing without a policy to act on it. The policy file defines the rules Backstop enforces:
+
+```json
+{
+  "require_approval_for_risks": ["HIGH", "IMPACT_CRITICAL", "CRITICAL"],
+  "block_operations": ["DROP DATABASE", "DROP SCHEMA"],
+  "require_recovery_for_critical": true,
+  "block_unknown_or_parse_failure": true,
+  "impact_analysis_enabled": true,
+  "max_write_rows_without_critical": 1000,
+  "max_write_percent_without_critical": 50
+}
+```
+
+The three policy outcomes are:
+
+| Outcome | Meaning |
+|---|---|
+| `execute` | Query proceeds to the database immediately |
+| `approval_required` | Query is held; operator must approve or deny via API |
+| `block` | Query is rejected; never touches the database |
+
+Policy is evaluated deterministically. The same query with the same policy always produces the same outcome. There is no ML or probabilistic decision-making in the policy layer.
+
+## Layer 3 — Recovery readiness gate
+
+For `CRITICAL` operations (those that could permanently destroy data), Backstop adds a second gate: **can you actually recover if this goes wrong?**
+
+Before a CRITICAL operation can be approved (even with explicit operator approval), Backstop verifies:
+
+1. A snapshot of the target table exists in S3/MinIO
+2. The snapshot is within the configured max age (default: 5 minutes)
+3. The sync sidecar heartbeat is current (default: 2 minutes max)
+4. The snapshot manifest checksum validates successfully
+
+If any check fails, the operation is blocked — regardless of the operator's approval status.
+
+This gate exists because real incidents happen under time pressure. An operator may approve a risky operation believing there's a recent backup, when in fact the sidecar has been down for 30 minutes. The gate forces honesty.
+
+## Layer 4 — Bypass detection
+
+Layers 1–3 only work when queries flow through the gateway. Backstop cannot intercept a query that goes directly to PostgreSQL.
+
+To detect this, the sync sidecar monitors `pg_stat_activity` for connections made with agent-role credentials. If a direct connection is detected:
+
+- An alert is generated
+- The prevention posture is marked as **degraded**
+- Prometheus metrics are updated
+
+<Callout type="danger" title="Bypass makes Backstop recovery-only">
+  If an agent has direct PostgreSQL credentials, Backstop cannot prevent destruction — it can only help you recover. The credential model must be correct for layers 1–3 to function. See the [Credential Model](/docs/security/credential-model) guide.
+</Callout>
+
+## Guarantees and limits
+
+Backstop provides strong guarantees within its operational boundary. Be explicit about the limits:
+
+**What Backstop guarantees:**
+- Every query through the gateway is classified before execution
+- No CRITICAL operation executes without a verified snapshot
+- All queries are audited with full metadata
+- Approved operations are recoverable within the snapshot window
+
+**What Backstop cannot guarantee:**
+- Protection against `DROP DATABASE` or `DROP SCHEMA` (no pre-op table snapshot is possible)
+- Protection if the agent holds direct PostgreSQL credentials
+- Cross-table transactional consistency without recovery groups
+- Recovery of data written after the snapshot was taken
+
+**What you must run alongside Backstop:**
+- Standard PostgreSQL PITR for full-cluster disaster recovery
+- Regular logical backups for schema-level objects
+- Access controls that prevent agents from connecting to PostgreSQL directly

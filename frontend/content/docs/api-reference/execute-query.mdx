@@ -1,0 +1,146 @@
+---
+title: execute_query
+description: The primary JSON-RPC tool for executing SQL through the Backstop gateway — request format, all response statuses, and safety_metadata fields.
+---
+
+import { ApiMethod, PropertyTable, RiskBadge } from "@/components/docs/mdx-components";
+
+`execute_query` is the primary tool for submitting SQL to the Backstop gateway. It classifies, gates, snapshots, and executes — returning the full classification metadata alongside the query result.
+
+## Request
+
+<ApiMethod method="POST" path="/" auth="query:execute scope">
+  JSON-RPC 2.0 over HTTP POST. Content-Type must be application/json.
+</ApiMethod>
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "execute_query",
+    "arguments": {
+      "query": "DELETE FROM sessions WHERE expires_at < NOW()",
+      "agent_id": "cursor-local",
+      "db_url": "postgresql://postgres:password@localhost:5432/mydb",
+      "snapshot_id": "snap_a3f9e2c1"
+    }
+  }
+}
+```
+
+### Arguments
+
+<PropertyTable properties={[
+  { name: "query", type: "string", required: true, description: "The SQL statement to execute. Single statement only — batched statements are not supported." },
+  { name: "agent_id", type: "string", required: true, description: "Identifier for the submitting agent. Used in audit logs and quarantine tracking." },
+  { name: "db_url", type: "string", required: false, description: "PostgreSQL connection string. If omitted, uses the gateway's default database URL." },
+  { name: "snapshot_id", type: "string", required: false, description: "Snapshot ID to include when resubmitting an approved CRITICAL query. Required for CRITICAL operations after approval." }
+]} />
+
+## Response statuses
+
+### executed
+
+Query was classified, policy allowed it, and it executed successfully.
+
+```json
+{
+  "status": "executed",
+  "risk_level": "LOW",
+  "result_type": "command",
+  "rows_affected": 127,
+  "safety_metadata": { ... }
+}
+```
+
+### blocked
+
+Query was classified and policy blocked it. No execution occurred.
+
+```json
+{
+  "status": "blocked",
+  "risk_level": "CRITICAL",
+  "message": "DROP TABLE is blocked by policy",
+  "safety_metadata": { ... }
+}
+```
+
+### approval_required
+
+Query requires operator approval. A snapshot was captured (if CRITICAL). The agent must resubmit with the same `snapshot_id` after approval.
+
+```json
+{
+  "status": "approval_required",
+  "risk_level": "CRITICAL",
+  "approval_id": "appr_4f9e2c1a",
+  "snapshot_id": "snap_a3f9e2c1",
+  "message": "CRITICAL operation requires operator approval. Snapshot captured.",
+  "safety_metadata": { ... }
+}
+```
+
+### denied
+
+An operator explicitly denied the approval. The query will not execute.
+
+```json
+{
+  "status": "denied",
+  "approval_id": "appr_4f9e2c1a",
+  "message": "Operator denied execution"
+}
+```
+
+### failed
+
+Execution failed after approval and gating — a database-level error.
+
+```json
+{
+  "status": "failed",
+  "error": "relation \"users\" does not exist",
+  "risk_level": "CRITICAL"
+}
+```
+
+## safety_metadata fields
+
+<PropertyTable properties={[
+  { name: "risk_level", type: "string", description: "SAFE, LOW, HIGH, IMPACT_CRITICAL, or CRITICAL" },
+  { name: "operation", type: "string", description: "SQL operation type: SELECT, INSERT, UPDATE, DELETE, DROP, TRUNCATE, DDL, WRITE, etc." },
+  { name: "table", type: "string", description: "Target table name" },
+  { name: "schema", type: "string", description: "Target schema name (default: public)" },
+  { name: "table_recoverable", type: "boolean", description: "Whether the table can be recovered from a Parquet snapshot" },
+  { name: "recovery_required", type: "boolean", description: "Whether a snapshot is required before this operation can execute" },
+  { name: "recovery_possible", type: "boolean", description: "Whether a valid snapshot currently exists for this table" },
+  { name: "policy_action", type: "string", description: "execute, approve, or block" },
+  { name: "policy_reason", type: "string", description: "Human-readable explanation of the policy decision" },
+  { name: "requires_approval", type: "boolean", description: "Whether this query requires operator approval" },
+  { name: "parse_error_present", type: "boolean", description: "True if the SQL could not be fully parsed" },
+  { name: "estimated_affected_rows", type: "number", description: "Estimated rows affected, from pg_class statistics" },
+  { name: "affected_percent", type: "number", description: "Estimated percentage of the table affected (0–100)" },
+  { name: "protected_table", type: "boolean", description: "True if the target table is in protected_tables" },
+  { name: "protected_columns", type: "string[]", description: "Any protected columns referenced in this query" }
+]} />
+
+## Rows response (SELECT)
+
+```json
+{
+  "status": "executed",
+  "risk_level": "SAFE",
+  "result_type": "rows",
+  "columns": ["id", "email", "created_at"],
+  "row_count": 3,
+  "rows": [
+    { "id": 1, "email": "alice@example.com", "created_at": "2026-01-01T00:00:00Z" },
+    { "id": 2, "email": "bob@example.com",   "created_at": "2026-01-02T00:00:00Z" },
+    { "id": 3, "email": "carol@example.com", "created_at": "2026-01-03T00:00:00Z" }
+  ],
+  "preview": [ ... ]
+}
+```

@@ -1,0 +1,105 @@
+---
+title: Authentication
+description: How Backstop's bearer token authentication works, token scopes, and how to configure multi-token setups for different agents and operators.
+---
+
+import { Callout, PropertyTable } from "@/components/docs/mdx-components";
+
+The Backstop gateway uses bearer token authentication. All requests (except `/health`) require an `Authorization` header.
+
+## Bearer token
+
+```
+Authorization: Bearer <token>
+```
+
+Tokens are defined in a JSON file and passed to the gateway at startup:
+
+```bash
+BACKSTOP_TOKENS=/etc/backstop/tokens.json backstop-gateway
+```
+
+## Token file format
+
+```json
+[
+  {
+    "id": "agent-prod-01",
+    "token": "bsp_prod_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["query:execute", "query:analyze", "metadata:read"],
+    "description": "Production agent — cursor-pratyush"
+  },
+  {
+    "id": "operator-01",
+    "token": "bsp_ops_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["approval:read", "approval:write", "metadata:read"],
+    "description": "Operator — PagerDuty webhook"
+  },
+  {
+    "id": "prometheus",
+    "token": "bsp_prom_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["metrics:read"],
+    "description": "Prometheus scrape"
+  },
+  {
+    "id": "admin",
+    "token": "bsp_admin_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["admin:*", "query:execute", "query:analyze", "approval:read", "approval:write", "metadata:read", "metrics:read"],
+    "description": "Emergency admin — break-glass only"
+  }
+]
+```
+
+## Scopes reference
+
+| Scope | Access granted |
+|---|---|
+| `query:execute` | `execute_query` tool — run SQL through the gateway |
+| `query:analyze` | `analyze_query` tool — classify without executing |
+| `approval:read` | `GET /pending` — list pending approvals |
+| `approval:write` | `POST /approve/{id}`, `POST /deny/{id}` |
+| `metadata:read` | `/metadata/snapshots`, `/metadata/audit`, `/metadata/alerts`, `/metadata/health` |
+| `metrics:read` | `GET /metrics` — Prometheus endpoint |
+| `admin:*` | All admin endpoints: `/admin/pause`, `/admin/resume`, `/admin/status` |
+
+<Callout type="danger" title="Principle of least privilege">
+  AI agents should only receive `query:execute` and `query:analyze`. Never give an agent `approval:write` or `admin:*` — this would allow it to approve its own destructive queries, defeating the entire safety model.
+</Callout>
+
+## Token generation
+
+Generate cryptographically random tokens:
+
+```bash
+# macOS / Linux
+openssl rand -hex 32
+
+# Node.js
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+# Python
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+## Error responses
+
+| HTTP status | Meaning |
+|---|---|
+| `401 Unauthorized` | Missing or invalid token |
+| `403 Forbidden` | Token valid but lacks required scope |
+
+```json
+{
+  "error": "insufficient_scope",
+  "message": "Token does not have approval:write scope",
+  "required_scope": "approval:write"
+}
+```
+
+## Development token
+
+The default development token is `dev-token` with full access. It is only active when `BACKSTOP_DEV_MODE=true` is set. Never use in production.
+
+<Callout type="warning">
+  The dev-token is intentionally obvious. If you see it in production logs, your token configuration is wrong.
+</Callout>

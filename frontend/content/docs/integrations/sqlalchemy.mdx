@@ -1,0 +1,107 @@
+---
+title: SQLAlchemy
+description: Attach Backstop protection to an existing SQLAlchemy engine with the Python SDK.
+---
+
+import { Callout, Steps, Step, Tabs, Tab } from "@/components/docs/mdx-components";
+
+SQLAlchemy is widely used in Python data pipelines, web backends, and AI agent stacks. Backstop's current Python SDK integration attaches to an existing SQLAlchemy engine and intercepts statements through SQLAlchemy's `before_cursor_execute` hook.
+
+## Engine hook integration
+
+This integration keeps your existing engine and session usage intact. Backstop classifies the SQL before the DBAPI cursor executes, and in Python SDK `protect` mode it can capture before-images for table-level recoverable operations.
+
+```python
+from sqlalchemy import create_engine
+import backstop
+
+engine = create_engine("postgresql://postgres:password@localhost:5432/mydb")
+safe_engine = backstop.protect_engine(
+    engine=engine,
+    storage="s3://prod-snapshots@http://localhost:9000",
+    actor="sqlalchemy-pipeline",
+    mode="protect",
+)
+
+# Use safe_engine anywhere you'd use engine
+with safe_engine.connect() as conn:
+    result = conn.execute(text("SELECT * FROM users LIMIT 10"))
+```
+
+<Callout type="info" title="Current scope">
+  The Python SQLAlchemy integration is local to your process. It is not the same thing as the Go gateway policy engine, scoped tokens, or approval workflow. For human approval and recovery-readiness enforcement, route agent SQL through the gateway using MCP or the Node client.
+</Callout>
+
+## ORM usage
+
+The proxy is transparent to SQLAlchemy's ORM:
+
+```python
+from sqlalchemy.orm import Session
+from your_models import User
+
+with Session(safe_engine) as session:
+    # SELECT — risk_level: SAFE, executes immediately
+    users = session.query(User).filter(User.active == True).all()
+
+    # DELETE — risk_level: HIGH or CRITICAL depending on scope
+    session.query(User).filter(User.created_at < cutoff).delete()
+    session.commit()  # Backstop intercepts at flush time
+```
+
+<Callout type="warning" title="Bulk deletes and ORM">
+  SQLAlchemy bulk operations (`.delete()`, `.update()`) issue raw SQL that Backstop classifies by table and estimated row count. A DELETE with no WHERE clause on a large table will be rated CRITICAL and require approval. Design your operations with this in mind.
+</Callout>
+
+## Alembic migrations
+
+Route migration SQL through an engine that has `protect_engine(...)` attached if you want local logging and snapshot behavior:
+
+```python
+# alembic/env.py
+from sqlalchemy import engine_from_config
+
+def run_migrations_online():
+    connectable = engine_from_config(config.get_section(config.config_ini_section))
+    safe_connectable = backstop.protect_engine(
+        engine=connectable,
+        storage=os.environ["BACKSTOP_STORAGE_URL"],
+        actor="alembic-migrations",
+        mode="monitor",
+    )
+
+    with safe_connectable.connect() as connection:
+        context.configure(connection=connection)
+        with context.begin_transaction():
+            context.run_migrations()
+```
+
+For production schema changes that need approval and stronger safety policy, prefer routing through the gateway instead of relying only on the local Python SDK hook.
+
+## Behavior notes
+
+The SQLAlchemy integration follows the Python SDK behavior:
+
+```python
+engine = backstop.protect_engine(
+    engine=engine,
+    storage="s3://prod-snapshots",
+    actor="sqlalchemy-app",
+    mode="block",
+)
+```
+
+- `protect` snapshots then executes supported destructive operations
+- `monitor` logs/classifies but does not block
+- `block` raises on `CRITICAL` local classifications
+- snapshot failure in `protect` mode is logged and the original query still executes
+- unrecoverable operations such as `DROP DATABASE` should be handled at the gateway or infrastructure layer
+
+## Configuration reference
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `engine` | SQLAlchemy Engine | required | Existing engine to instrument |
+| `storage` | string | required | S3-compatible storage URL for snapshots |
+| `actor` | string | `None` | Identifier recorded in local audit logs |
+| `mode` | string | `"protect"` | One of `protect`, `monitor`, or `block` |

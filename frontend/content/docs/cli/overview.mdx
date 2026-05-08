@@ -1,0 +1,173 @@
+---
+title: CLI reference
+description: Complete reference for the Backstop CLI — doctor, drill, snapshots, restore, backup, pitr, and wal commands.
+---
+
+import { Callout, Terminal } from "@/components/docs/mdx-components";
+
+The Backstop CLI provides tools for validation, recovery drills, snapshot management, and point-in-time recovery preparation. Install it with the Python package.
+
+## Installation
+
+```bash
+pip install backstop
+# Verify:
+backstop --version
+```
+
+## doctor
+
+Validates that required system tools and permissions are available.
+
+```bash
+# Check native tools (pg_dump, pg_restore, psql)
+backstop doctor native-tools
+
+# Check S3 storage permissions
+backstop doctor storage-permissions \
+  --storage s3://prod-snapshots@http://localhost:9000 \
+  --strict
+
+# JSON output for automation
+backstop doctor native-tools --json
+```
+
+**`--strict`** — fails if any optional tool is missing (recommended for production validation).
+
+**`--json`** — outputs structured JSON for scripting and CI checks.
+
+## drill
+
+Runs recovery validation drills without affecting production data. Use these before go-live and in scheduled maintenance windows.
+
+```bash
+# Validate WAL archive fetch (PITR prerequisite)
+backstop drill wal-archive-fetch \
+  --storage s3://prod-snapshots \
+  --cluster-id prod
+
+# Simulate PITR preparation (dry run, no actual restore)
+backstop drill pitr-prepare \
+  --storage s3://prod-snapshots \
+  --cluster-id prod \
+  --target-dir /tmp/pitr-test \
+  --simulate
+
+# Full logical backup and restore drill (uses a test database)
+backstop drill logical-backup-restore \
+  --source-db postgresql://postgres@localhost:5432/mydb \
+  --target-db postgresql://postgres@localhost:5432/mydb_test \
+  --storage s3://prod-snapshots
+```
+
+<Callout type="info" title="Run drills before production">
+  The [Production checklist](/docs/operations/production-checklist) requires at least one successful run of each drill type before enabling Backstop in production. Drills surface configuration problems before you need them in an incident.
+</Callout>
+
+## snapshots
+
+Manages the Parquet snapshots stored in S3.
+
+```bash
+# List snapshots for a table
+backstop snapshots list \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --table users
+
+# List all snapshots
+backstop snapshots list \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots
+```
+
+## restore
+
+Restores a table from a Parquet snapshot. This is the fastest recovery path, but actual restore time depends on table size, storage throughput, and whether you run preview or validation first.
+
+```bash
+# Dry run first — always
+backstop restore \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --snapshot-id snap_a3f9e2c1 \
+  --table users \
+  --dry-run
+
+# Execute restore
+backstop restore \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --snapshot-id snap_a3f9e2c1 \
+  --table users
+```
+
+The restore verifies the manifest checksum before writing any data.
+
+## backup
+
+Logical database backups using pg_dump.
+
+```bash
+# Create a full logical backup
+backstop backup logical-create \
+  --db postgresql://postgres@localhost:5432/mydb \
+  --storage s3://prod-snapshots
+
+# Restore from a logical backup
+backstop backup logical-restore \
+  --db postgresql://postgres@localhost:5432/mydb_restored \
+  --storage s3://prod-snapshots \
+  --backup-id backup_2026-05-06 \
+  --clean
+```
+
+`--clean` drops existing database objects before restoring.
+
+## pitr
+
+Prepares Point-in-Time Recovery using PostgreSQL's WAL archiving.
+
+```bash
+# Create a base backup (requires replication permissions)
+backstop pitr basebackup \
+  --db postgresql://replication_user@localhost:5432/mydb \
+  --storage s3://prod-snapshots \
+  --cluster-id prod
+
+# Prepare a PITR restore at a specific point in time
+backstop pitr prepare-restore \
+  --storage s3://prod-snapshots \
+  --cluster-id prod \
+  --backup-id backup_2026-05-06 \
+  --target-dir /var/lib/postgresql/data \
+  --target-time "2026-05-06 12:30:00+00"
+```
+
+## wal
+
+WAL archiving commands, designed to be called by PostgreSQL's `archive_command`.
+
+```bash
+# Archive a WAL file (called by PostgreSQL archive_command)
+backstop wal archive \
+  --storage s3://prod-snapshots \
+  --cluster-id prod \
+  --wal-file %p \
+  --wal-name %f
+
+# Fetch a WAL file (called by PostgreSQL restore_command)
+backstop wal fetch \
+  --storage s3://prod-snapshots \
+  --cluster-id prod \
+  --wal-name 00000001000000000000001F \
+  --wal-file /var/lib/postgresql/wal/
+```
+
+Configure in `postgresql.conf`:
+
+```
+archive_mode = on
+archive_command = 'backstop wal archive --storage s3://prod-snapshots --cluster-id prod --wal-file %p --wal-name %f'
+restore_command = 'backstop wal fetch --storage s3://prod-snapshots --cluster-id prod --wal-name %f --wal-file %p'
+```

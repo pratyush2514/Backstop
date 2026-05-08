@@ -1,0 +1,158 @@
+---
+title: Quick start
+description: Get Backstop running and protecting a local PostgreSQL database in under 5 minutes using Docker Compose.
+---
+
+import { Callout, Steps, Step, Terminal } from "@/components/docs/mdx-components";
+
+This guide gets you from zero to a running Backstop stack with a live interception demo. You need Docker and Docker Compose installed.
+
+<Callout type="info" title="What you'll have at the end">
+  A running gateway (`:8080`), sync sidecar, PostgreSQL instance, MinIO for snapshot storage, and Prometheus — all wired together. You'll execute a `DROP TABLE` through the SDK and watch it get intercepted and snapshotted.
+</Callout>
+
+## Prerequisites
+
+- Docker 24+ and Docker Compose v2
+- Python 3.9+ or Node.js 18+ (depending on which SDK you want to try)
+- 4 GB of free RAM
+
+## Step 1 — Clone and start services
+
+```bash
+git clone https://github.com/your-org/backstop.git
+cd backstop
+docker compose up -d
+```
+
+This starts five services:
+
+| Service | Port | Purpose |
+|---|---|---|
+| `backstop-gateway` | 8080 | SQL proxy and policy enforcement |
+| `backstop-sync` | 9091 (metrics) | Table snapshots and bypass detection |
+| `postgres` | 5432 | Your protected database |
+| `minio` | 9000 | S3-compatible snapshot storage |
+| `prometheus` | 9090 | Metrics collection |
+
+Check that everything is healthy:
+
+<Terminal title="terminal">
+$ docker compose ps
+NAME                 STATUS    PORTS
+backstop-gateway     running   0.0.0.0:8080->8080/tcp
+backstop-sync        running
+postgres             running   0.0.0.0:5432->5432/tcp
+minio                running   0.0.0.0:9000->9000/tcp
+prometheus           running   0.0.0.0:9090->9090/tcp
+
+$ curl http://localhost:8080/health
+{`{"status":"ok","gateway":"running","sidecar":"healthy"}`}
+</Terminal>
+
+## Step 2 — Seed the database
+
+```bash
+docker compose exec postgres psql -U postgres -d backstop_dev -f /docker-entrypoint-initdb.d/seed.sql
+```
+
+This creates a `users` table with 50,000 sample rows — enough to demonstrate the row-count estimation in the interception response.
+
+## Step 3 — Install the SDK
+
+<Steps>
+  <Step title="Python SDK">
+    ```bash
+    pip install backstop
+    ```
+  </Step>
+  <Step title="Node.js SDK">
+    ```bash
+    npm install @backstop/client
+    ```
+  </Step>
+</Steps>
+
+## Step 4 — Run your first protected query
+
+### Python
+
+```python
+import psycopg2
+import backstop
+
+raw_conn = psycopg2.connect("postgresql://postgres:postgres@localhost:5432/backstop_dev")
+
+db = backstop.guard(
+    conn=raw_conn,
+    storage="s3://backstop-snapshots@http://localhost:9000",
+    actor="quickstart-demo",
+    mode="protect",
+)
+
+# This is safe — executes immediately
+rows = db.execute("SELECT COUNT(*) FROM users")
+print(f"Users: {rows[0][0]}")   # → Users: 50000
+
+# This is CRITICAL — gets intercepted and snapshotted
+try:
+    db.execute("DROP TABLE users")
+except backstop.PolicyBlockedError as e:
+    print(f"Blocked: {e.risk_level} — {e.policy_reason}")
+```
+
+### Node.js
+
+```typescript
+import { BackstopClient } from "@backstop/client";
+
+const backstop = new BackstopClient({
+  url: "http://localhost:8080",
+  token: "dev-token",
+  agentId: "quickstart-demo",
+});
+
+// Safe — executes immediately
+const count = await backstop.query("SELECT COUNT(*) FROM users");
+console.log("Users:", count.rows?.[0]);
+
+// Critical — intercepted
+const result = await backstop.executeQuery("DROP TABLE users");
+console.log("Status:", result.status);       // "blocked" or "approval_required"
+console.log("Risk:", result.risk_level);     // "CRITICAL"
+console.log("Snapshot:", result.snapshot_id); // "snap_a3f9..."
+```
+
+## Step 5 — See the audit trail
+
+```bash
+curl http://localhost:8080/metadata/audit | jq '.events[] | {sql, risk_level, status, agent_id}'
+```
+
+You'll see every query — safe and critical — with full classification metadata.
+
+## Step 6 — Restore from snapshot (optional)
+
+If you allowed the DROP and want to restore:
+
+```bash
+backstop restore \
+  --db postgresql://postgres:postgres@localhost:5432/backstop_dev \
+  --storage s3://backstop-snapshots@http://localhost:9000 \
+  --snapshot-id snap_a3f9 \
+  --table users \
+  --dry-run
+```
+
+Remove `--dry-run` to execute the restore. The recovered table build time depends on table size and storage speed; use preview or validation first if you want to inspect the restore path before mutating anything.
+
+## What to do next
+
+- Read [How it works](/docs/getting-started/how-it-works) to understand the safety model
+- Explore [Risk classification](/docs/concepts/risk-classification) to understand all five risk levels
+- Set up [Policy configuration](/docs/concepts/policy-configuration) for production behavior
+- Connect your real AI agent via the [Python SDK](/docs/sdks/python) or [Node.js SDK](/docs/sdks/nodejs)
+
+<Callout type="warning" title="Don't use dev-token in production">
+  The default `dev-token` has full admin access. For production, generate scoped tokens with minimal permissions. See [Token scopes](/docs/security/token-scopes).
+</Callout>

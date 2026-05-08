@@ -1,0 +1,126 @@
+---
+title: Snapshot system
+description: How Backstop captures, stores, verifies, and restores table snapshots using Parquet files in S3-compatible object storage.
+---
+
+import { Callout, Terminal } from "@/components/docs/mdx-components";
+
+Backstop's snapshot system is the recovery foundation. Snapshots are point-in-time table captures stored as Parquet files in your own S3-compatible storage. They are what make a CRITICAL operation reversible.
+
+## How snapshots are taken
+
+The sync sidecar takes snapshots in two modes:
+
+**Continuous background snapshots** — The sidecar runs on a configurable interval and captures all tables in the target database. For each table, it:
+1. Reads all rows from PostgreSQL
+2. Converts to Apache Parquet format with full column types
+3. Uploads to S3/MinIO under `s3://bucket/snapshots/{table}/{timestamp}.parquet`
+4. Writes a manifest file with row count, column schema, and checksums
+5. Reports liveness via the heartbeat record in SQLite
+
+**On-demand snapshots** — When a CRITICAL operation is submitted through the gateway, the gateway can trigger an immediate on-demand snapshot before the approval gate. This ensures the snapshot is as fresh as possible relative to the approval decision.
+
+## Storage format
+
+Snapshots are stored in Apache Parquet:
+
+- **Columnar storage** — efficient reads for large tables
+- **Full type fidelity** — PostgreSQL types are preserved in Parquet schema
+- **Compression** — Snappy compression by default
+- **Manifest** — every snapshot has a `.manifest.json` alongside it:
+
+```json
+{
+  "snapshot_id": "snap_a3f9e2c1",
+  "table": "users",
+  "schema": "public",
+  "row_count": 1842933,
+  "columns": ["id", "email", "name", "created_at"],
+  "parquet_path": "snapshots/users/2026-05-06T10:30:00Z.parquet",
+  "checksum": "sha256:9f86d081884c7d659a2feaa0c55ad015",
+  "created_at": "2026-05-06T10:30:00Z",
+  "source": "sidecar",
+  "db_size_bytes": 218000000
+}
+```
+
+## Snapshot storage URL format
+
+Backstop uses a URL convention to specify S3-compatible storage:
+
+```
+s3://bucket-name@http://endpoint-url
+s3://bucket-name                        # AWS S3 (uses AWS SDK credentials)
+s3://bucket-name@http://localhost:9000  # MinIO local
+s3://bucket-name@https://storage.example.com  # any S3-compatible API
+```
+
+## Recovery readiness gate
+
+Before any CRITICAL operation can be approved, the gateway checks:
+
+| Check | Default threshold |
+|---|---|
+| Snapshot exists for target table | Required |
+| Snapshot age | Max 300 seconds (5 min) |
+| Sidecar heartbeat age | Max 120 seconds (2 min) |
+| Manifest checksum valid | Required |
+
+All checks must pass. If the sidecar has been down for more than 2 minutes, CRITICAL operations are blocked even with operator approval.
+
+<Callout type="warning" title="Snapshot staleness">
+  If your database tables are very large, the sidecar snapshot interval may be longer than the max_snapshot_age threshold. In this case, CRITICAL operations will be blocked. Tune `max_snapshot_age_seconds` to match your sidecar interval, or use on-demand snapshots triggered by the gateway.
+</Callout>
+
+## Restoring from a snapshot
+
+### Fast table restore
+
+The `backstop restore` command reads a Parquet snapshot and writes it back to the target table. It is the fastest recovery path, but runtime depends on table size, storage throughput, and whether you restore into a recovered table first for validation.
+
+```bash
+# Dry run — shows what would be restored
+backstop restore \
+  --db postgresql://postgres:postgres@localhost:5432/mydb \
+  --storage s3://backstop-snapshots@http://localhost:9000 \
+  --snapshot-id snap_a3f9e2c1 \
+  --table users \
+  --dry-run
+
+# Execute restore
+backstop restore \
+  --db postgresql://postgres:postgres@localhost:5432/mydb \
+  --storage s3://backstop-snapshots@http://localhost:9000 \
+  --snapshot-id snap_a3f9e2c1 \
+  --table users
+```
+
+The restore:
+1. Verifies the manifest checksum
+2. Reads the Parquet file from S3
+3. Truncates the target table (if it exists) or re-creates it
+4. Bulk-inserts all rows using `COPY FROM STDIN`
+5. Verifies row count matches the manifest
+
+### Listing available snapshots
+
+```bash
+backstop snapshots list \
+  --db postgresql://postgres:postgres@localhost:5432/mydb \
+  --storage s3://backstop-snapshots@http://localhost:9000 \
+  --table users
+```
+
+Or via the API:
+
+```bash
+curl http://localhost:8080/metadata/snapshots?table=users | jq '.snapshots'
+```
+
+## Limitations
+
+- Snapshots are **per-table**. They do not capture foreign key relationships or cross-table consistency. If you drop a table that is referenced by another, restoring just that table may violate referential integrity.
+- Snapshots capture **rows only**. Schema (DDL), indexes, triggers, and constraints are not captured in the Parquet file. For full schema recovery, use logical backups.
+- Snapshot data reflects the state **at snapshot time**. Data written after the snapshot was taken is not recoverable from the snapshot alone — you need PITR for that window.
+
+For schema recovery and post-snapshot data recovery, see the [Operations runbooks](/docs/operations/runbooks).

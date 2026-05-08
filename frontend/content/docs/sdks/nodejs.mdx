@@ -1,0 +1,183 @@
+---
+title: Node.js SDK
+description: Complete reference for @backstop/client — BackstopClient, all methods, error types, and TypeScript patterns.
+---
+
+import { PropertyTable, Callout } from "@/components/docs/mdx-components";
+
+`@backstop/client` is the TypeScript SDK for interacting with the Backstop gateway. It wraps the JSON-RPC API with a typed interface, automatic retries, and structured error types.
+
+## Installation
+
+```bash
+npm install @backstop/client
+# or
+yarn add @backstop/client
+# or
+pnpm add @backstop/client
+```
+
+**Requirements:** Node.js 18+, TypeScript 5+ (for full type support)
+
+## Initialization
+
+```typescript
+import { BackstopClient } from "@backstop/client";
+
+const backstop = new BackstopClient({
+  url: process.env.BACKSTOP_URL ?? "http://localhost:8080",
+  token: process.env.BACKSTOP_TOKEN ?? "dev-token",
+  agentId: process.env.BACKSTOP_AGENT_ID ?? "my-agent",
+  timeoutMs: 30_000,  // optional, default 30s
+});
+```
+
+### Constructor options
+
+<PropertyTable properties={[
+  { name: "url", type: "string", required: true, description: "Base URL of the Backstop gateway. Include the port but not a path." },
+  { name: "token", type: "string", required: true, description: "Bearer token for authentication. Must have at minimum query:execute scope for most operations." },
+  { name: "agentId", type: "string", required: true, description: "Stable identifier for this agent. Used in audit logs and for quarantine tracking. Should be consistent across sessions." },
+  { name: "timeoutMs", type: "number", required: false, default: "30000", description: "Request timeout in milliseconds." },
+  { name: "dbUrl", type: "string", required: false, description: "PostgreSQL connection string to use as default for all queries. Can be overridden per-call." }
+]} />
+
+## executeQuery()
+
+Executes SQL against the database, subject to Backstop's policy.
+
+```typescript
+const result = await backstop.executeQuery("SELECT COUNT(*) FROM users");
+
+console.log(result.status);      // "executed"
+console.log(result.row_count);   // 50000
+console.log(result.rows);        // [{ count: "50000" }]
+console.log(result.risk_level);  // "SAFE"
+```
+
+```typescript
+const result = await backstop.executeQuery("DROP TABLE users");
+// If policy requires approval:
+console.log(result.status);       // "approval_required"
+console.log(result.approval_id);  // "appr_4f9e2c1a"
+console.log(result.snapshot_id);  // "snap_a3f9"
+console.log(result.risk_level);   // "CRITICAL"
+```
+
+### Options
+
+<PropertyTable properties={[
+  { name: "agentId", type: "string", required: false, description: "Override the default agentId for this call." },
+  { name: "dbUrl", type: "string", required: false, description: "Override the default database URL for this call." },
+  { name: "snapshotId", type: "string", required: false, description: "Provide a snapshot ID when resubmitting an approved query." },
+  { name: "throwOnPolicyViolation", type: "boolean", required: false, default: "false", description: "If true, throws BackstopPolicyBlockedError instead of returning a blocked result object." },
+  { name: "timeoutMs", type: "number", required: false, description: "Per-call timeout override." },
+  { name: "signal", type: "AbortSignal", required: false, description: "AbortSignal for request cancellation." }
+]} />
+
+## analyzeQuery()
+
+Classifies SQL without executing it. Useful for pre-flight checks.
+
+```typescript
+const analysis = await backstop.analyzeQuery("DELETE FROM payments");
+
+console.log(analysis.risk_level);              // "CRITICAL"
+console.log(analysis.safety_metadata.operation); // "DELETE"
+console.log(analysis.safety_metadata.table);     // "payments"
+console.log(analysis.safety_metadata.estimated_affected_rows); // 432118
+```
+
+## query()
+
+Alias for `executeQuery()`. Provided for ergonomics in simple use cases.
+
+```typescript
+const result = await backstop.query("SELECT * FROM users LIMIT 10");
+```
+
+## Approval and admin methods
+
+```typescript
+// List pending approvals (requires approval:read scope)
+const pending = await backstop.getPendingApprovals();
+
+// Approve a query
+await backstop.approve("appr_4f9e2c1a");
+
+// Deny a query
+await backstop.deny("appr_4f9e2c1a");
+
+// Emergency pause (requires admin:* scope)
+await backstop.pause("Suspicious agent activity detected");
+
+// Resume after pause
+await backstop.resume("Incident resolved");
+
+// Check admin status
+const status = await backstop.getAdminStatus();
+console.log(status.paused); // true/false
+```
+
+## Metadata methods
+
+```typescript
+// List snapshots for a table
+const snapshots = await backstop.listSnapshots({ table: "users" });
+
+// Get audit events
+const events = await backstop.getAudit({ agentId: "cursor-local", risk: "CRITICAL" });
+
+// Get alerts
+const alerts = await backstop.getAlerts();
+
+// Get health status
+const health = await backstop.getHealth();
+```
+
+## Error types
+
+```typescript
+import {
+  BackstopAuthError,
+  BackstopNetworkError,
+  BackstopTimeoutError,
+  BackstopPolicyBlockedError,
+  BackstopApprovalRequiredError,
+  BackstopRecoveryNotReadyError,
+} from "@backstop/client";
+
+try {
+  await backstop.executeQuery("DROP TABLE users", {
+    throwOnPolicyViolation: true,
+  });
+} catch (err) {
+  if (err instanceof BackstopPolicyBlockedError) {
+    // Query was permanently blocked
+    console.log(err.riskLevel);    // "CRITICAL"
+    console.log(err.policyReason); // "DROP TABLE blocked by policy"
+
+  } else if (err instanceof BackstopApprovalRequiredError) {
+    // Query needs operator approval — not an error per se
+    console.log(err.approvalId);   // "appr_4f9e2c1a"
+    console.log(err.snapshotId);   // "snap_a3f9"
+
+  } else if (err instanceof BackstopRecoveryNotReadyError) {
+    // CRITICAL op approved but snapshot is stale or sidecar is down
+    console.log(err.message);
+
+  } else if (err instanceof BackstopAuthError) {
+    // 401 — invalid or expired token
+
+  } else if (err instanceof BackstopTimeoutError) {
+    // Request exceeded timeoutMs
+
+  } else if (err instanceof BackstopNetworkError) {
+    // Gateway unreachable — fail closed in your application
+  }
+}
+```
+
+<Callout type="danger" title="Fail closed on network errors">
+  If the Backstop gateway is unreachable (`BackstopNetworkError`), your application should refuse to execute the query rather than falling back to a direct database connection. Falling back defeats the purpose of the safety layer.
+</Callout>

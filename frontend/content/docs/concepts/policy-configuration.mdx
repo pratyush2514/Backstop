@@ -1,0 +1,107 @@
+---
+title: Policy configuration
+description: Complete reference for the Backstop policy file — every field, its behavior, and recommended values for development and production.
+---
+
+import { Callout, PropertyTable } from "@/components/docs/mdx-components";
+
+The policy file is a JSON document that controls all of Backstop's enforcement behavior. You pass it to the gateway on startup. There is no hot-reload — restart the gateway to apply changes.
+
+## Policy file location
+
+```bash
+# Pass via environment variable
+BACKSTOP_POLICY=/etc/backstop/policy.json
+
+# Or as a CLI flag
+backstop-gateway --policy /etc/backstop/policy.json
+```
+
+## Full reference
+
+```json
+{
+  "require_approval_for_risks": ["HIGH", "IMPACT_CRITICAL", "CRITICAL"],
+  "block_operations": ["DROP DATABASE", "DROP SCHEMA"],
+  "require_recovery_for_critical": true,
+  "block_unknown_or_parse_failure": true,
+  "block_unrecoverable_operations": true,
+  "max_snapshot_age_seconds": 300,
+  "require_sidecar_heartbeat": true,
+  "max_sidecar_heartbeat_seconds": 120,
+  "impact_analysis_enabled": true,
+  "max_write_rows_without_critical": 1000,
+  "max_write_percent_without_critical": 50,
+  "protected_tables": ["users", "payments"],
+  "protected_columns": {
+    "users": ["password", "api_key", "mfa_secret"],
+    "payments": ["card_number", "cvv"]
+  },
+  "max_blocked_attempts_per_window": 3,
+  "quarantine_duration_seconds": 1800,
+  "dangerous_retry_window_seconds": 600
+}
+```
+
+## Field reference
+
+<PropertyTable properties={[
+  { name: "require_approval_for_risks", type: "string[]", required: false, default: '["HIGH","IMPACT_CRITICAL","CRITICAL"]', description: "Risk levels that require operator approval before execution. SAFE and LOW are always executed immediately." },
+  { name: "block_operations", type: "string[]", required: false, default: '["DROP DATABASE","DROP SCHEMA"]', description: "Specific SQL operations to block unconditionally, regardless of approval. These operations cannot be snapshotted and are too destructive to allow." },
+  { name: "require_recovery_for_critical", type: "boolean", required: false, default: "true", description: "If true, CRITICAL operations require a verified snapshot before approval is accepted. Set to false only in development environments." },
+  { name: "block_unknown_or_parse_failure", type: "boolean", required: false, default: "true", description: "If true, SQL that cannot be parsed is treated as CRITICAL. Strongly recommended for production." },
+  { name: "block_unrecoverable_operations", type: "boolean", required: false, default: "true", description: "If true, operations classified as unrecoverable (e.g., DROP DATABASE) are blocked even with explicit approval." },
+  { name: "max_snapshot_age_seconds", type: "number", required: false, default: "300", description: "Maximum age of a snapshot (in seconds) for it to be considered valid for the recovery gate." },
+  { name: "require_sidecar_heartbeat", type: "boolean", required: false, default: "true", description: "If true, the sidecar must have reported a heartbeat within max_sidecar_heartbeat_seconds or CRITICAL operations are blocked." },
+  { name: "max_sidecar_heartbeat_seconds", type: "number", required: false, default: "120", description: "Maximum age of the sidecar heartbeat in seconds." },
+  { name: "impact_analysis_enabled", type: "boolean", required: false, default: "true", description: "If true, Backstop estimates the row count and percentage of table affected by write operations and may escalate LOW to IMPACT_CRITICAL." },
+  { name: "max_write_rows_without_critical", type: "number", required: false, default: "1000", description: "Threshold for escalating to IMPACT_CRITICAL based on estimated affected row count." },
+  { name: "max_write_percent_without_critical", type: "number", required: false, default: "50", description: "Threshold for escalating to IMPACT_CRITICAL based on estimated percentage of table affected (0–100)." },
+  { name: "protected_tables", type: "string[]", required: false, default: "[]", description: "Tables that receive additional scrutiny. Any write to a protected table is escalated to at least HIGH." },
+  { name: "protected_columns", type: "object", required: false, default: "{}", description: "Map of table name to column names. Writes to protected columns trigger escalation and alert." },
+  { name: "max_blocked_attempts_per_window", type: "number", required: false, default: "3", description: "Number of blocked/denied queries an agent can submit within dangerous_retry_window_seconds before being quarantined." },
+  { name: "quarantine_duration_seconds", type: "number", required: false, default: "1800", description: "How long a quarantined agent is blocked from submitting any queries." },
+  { name: "dangerous_retry_window_seconds", type: "number", required: false, default: "600", description: "The time window (in seconds) over which blocked attempt counts are tracked for quarantine purposes." }
+]} />
+
+## Recommended profiles
+
+### Development (permissive)
+
+```json
+{
+  "require_approval_for_risks": ["CRITICAL"],
+  "block_operations": ["DROP DATABASE"],
+  "require_recovery_for_critical": false,
+  "block_unknown_or_parse_failure": false,
+  "impact_analysis_enabled": false,
+  "max_blocked_attempts_per_window": 10
+}
+```
+
+<Callout type="warning">
+  Never use a permissive policy in production. The development profile is intended for local iteration on agent behavior only.
+</Callout>
+
+### Production (strict)
+
+```json
+{
+  "require_approval_for_risks": ["HIGH", "IMPACT_CRITICAL", "CRITICAL"],
+  "block_operations": ["DROP DATABASE", "DROP SCHEMA"],
+  "require_recovery_for_critical": true,
+  "block_unknown_or_parse_failure": true,
+  "block_unrecoverable_operations": true,
+  "max_snapshot_age_seconds": 300,
+  "require_sidecar_heartbeat": true,
+  "max_sidecar_heartbeat_seconds": 120,
+  "impact_analysis_enabled": true,
+  "max_write_rows_without_critical": 1000,
+  "max_write_percent_without_critical": 50,
+  "protected_tables": ["users", "payments"],
+  "protected_columns": { "users": ["password", "api_key"] },
+  "max_blocked_attempts_per_window": 3,
+  "quarantine_duration_seconds": 3600,
+  "dangerous_retry_window_seconds": 600
+}
+```

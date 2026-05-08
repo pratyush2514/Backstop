@@ -1,0 +1,78 @@
+---
+title: Metadata endpoints
+description: Endpoints for snapshots, audit events, alerts, health, and admin controls.
+---
+
+import { ApiMethod } from "@/components/docs/mdx-components";
+
+<ApiMethod method="GET" path="/metadata/snapshots" auth="metadata:read scope">
+  Lists available snapshots. Filter by table name with `?table=users`.
+</ApiMethod>
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://localhost:8080/metadata/snapshots?table=users"
+```
+
+---
+
+<ApiMethod method="GET" path="/metadata/audit" auth="metadata:read scope">
+  Returns audit events. Filter with `?agent_id=cursor-local&risk=CRITICAL&limit=50`.
+</ApiMethod>
+
+---
+
+<ApiMethod method="GET" path="/metadata/alerts" auth="metadata:read scope">
+  Returns system alerts — bypass detections, sidecar failures, storage issues.
+</ApiMethod>
+
+---
+
+<ApiMethod method="GET" path="/metadata/health" auth="metadata:read scope">
+  Returns component health: gateway, sidecar heartbeat age, storage connectivity, last snapshot age.
+</ApiMethod>
+
+```json
+{
+  "gateway": "running",
+  "sidecar_heartbeat_age_seconds": 34,
+  "sidecar_status": "healthy",
+  "last_snapshot_age_seconds": 180,
+  "storage_accessible": true,
+  "paused": false
+}
+```
+
+---
+
+<ApiMethod method="GET" path="/metrics" auth="metrics:read scope">
+  Prometheus metrics endpoint. Exposes gateway throughput, risk distribution, approval rates, and sidecar snapshot lag.
+</ApiMethod>
+
+---
+
+<ApiMethod method="POST" path="/admin/pause" auth="admin:* scope">
+  Emergency pause — stops all write and CRITICAL query execution. Reads (SAFE) continue.
+</ApiMethod>
+
+```json
+{ "reason": "Suspicious agent behavior — investigating" }
+```
+
+---
+
+<ApiMethod method="POST" path="/admin/resume" auth="admin:* scope">
+  Resumes normal operation after a pause.
+</ApiMethod>
+
+---
+
+<ApiMethod method="GET" path="/admin/status" auth="admin:* scope">
+  Returns the current admin state including pause status, reason, and environment info.
+</ApiMethod>
+
+---
+
+<ApiMethod method="GET" path="/health">
+  Unauthenticated health probe. Returns `{"status":"ok"}` if the gateway is running.
+</ApiMethod>

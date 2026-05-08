@@ -1,0 +1,122 @@
+---
+title: Token scopes
+description: Complete reference for all Backstop token scopes — what each one grants and the principle of least privilege for common roles.
+---
+
+import { Callout, PropertyTable } from "@/components/docs/mdx-components";
+
+Every bearer token is associated with one or more scopes. Scopes define exactly which endpoints and operations the token can access. A request with a valid token but missing scope returns `403 Forbidden`.
+
+## Scope reference
+
+| Scope | Grants access to |
+|---|---|
+| `query:execute` | `execute_query` — submit SQL for classification and execution |
+| `query:analyze` | `analyze_query` — classify SQL without executing |
+| `approval:read` | `GET /pending` — list queries awaiting approval |
+| `approval:write` | `POST /approve/{id}`, `POST /deny/{id}` |
+| `metadata:read` | `/metadata/snapshots`, `/metadata/audit`, `/metadata/alerts`, `/metadata/health` |
+| `metrics:read` | `GET /metrics` — Prometheus metrics endpoint |
+| `admin:*` | `POST /admin/pause`, `POST /admin/resume`, `GET /admin/status` |
+
+## Recommended scope sets by role
+
+### AI agent (Cursor, LangChain, SQLAlchemy, etc.)
+
+```json
+["query:execute", "query:analyze"]
+```
+
+The agent can run queries and analyze SQL. Nothing else.
+
+### Operator (human or automation)
+
+```json
+["approval:read", "approval:write", "metadata:read"]
+```
+
+Can review pending approvals, check health, and read audit logs. Cannot execute queries or use admin controls.
+
+### Monitoring (Prometheus, Grafana)
+
+```json
+["metrics:read"]
+```
+
+Metrics endpoint only. No access to query data, approvals, or audit events.
+
+### Admin (break-glass only)
+
+```json
+["admin:*", "query:execute", "query:analyze", "approval:read", "approval:write", "metadata:read", "metrics:read"]
+```
+
+Full access. Store the admin token in a hardware security module or secrets manager. Never use it for routine operations.
+
+### Read-only analyst
+
+```json
+["query:execute", "metadata:read"]
+```
+
+Can run SELECT queries (which Backstop classifies as SAFE and executes immediately) and read metadata. Cannot run writes.
+
+## The critical separation
+
+<Callout type="danger" title="Never combine query:execute and approval:write">
+  If a single token has both `query:execute` and `approval:write`, the holder of that token can submit a destructive query and approve it themselves. This defeats Backstop's entire safety model. These two scopes must always be on separate tokens held by separate parties.
+</Callout>
+
+The human-in-the-loop guarantee holds only when:
+
+1. The agent's token has `query:execute` but **not** `approval:write`
+2. The operator's token has `approval:write` but **not** `query:execute`
+3. These tokens are held by different parties (agent runtime vs. human operator or separate automation)
+
+## Token file example
+
+```json
+[
+  {
+    "id": "agent-cursor-pratyush",
+    "token": "bsp_prod_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["query:execute", "query:analyze"],
+    "description": "Cursor agent — pratyush@company.com"
+  },
+  {
+    "id": "agent-langchain-pipeline",
+    "token": "bsp_prod_yyyyyyyyyyyyyyyyyyyyyy",
+    "scopes": ["query:execute", "query:analyze"],
+    "description": "LangChain analytics pipeline"
+  },
+  {
+    "id": "operator-pagerduty",
+    "token": "bsp_ops_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["approval:read", "approval:write", "metadata:read"],
+    "description": "PagerDuty webhook — on-call approvals"
+  },
+  {
+    "id": "prometheus",
+    "token": "bsp_prom_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["metrics:read"],
+    "description": "Prometheus scrape"
+  },
+  {
+    "id": "admin",
+    "token": "bsp_admin_xxxxxxxxxxxxxxxxxxxxxx",
+    "scopes": ["admin:*", "query:execute", "query:analyze", "approval:read", "approval:write", "metadata:read", "metrics:read"],
+    "description": "Emergency admin — stored in Vault, not used routinely"
+  }
+]
+```
+
+## Scope enforcement
+
+Scope checking happens at the HTTP handler level before any business logic runs. The check is:
+
+1. Extract `Authorization: Bearer <token>` header
+2. Look up token in the token registry
+3. Verify the required scope is in the token's scope list
+4. Reject with `403` if not present
+
+The `admin:*` scope is a wildcard that matches all `admin:` prefixed scope checks.

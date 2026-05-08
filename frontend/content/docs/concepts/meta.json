@@ -1,0 +1,10 @@
+{
+  "title": "Concepts",
+  "pages": [
+    "safety-model",
+    "risk-classification",
+    "approval-workflow",
+    "snapshot-system",
+    "policy-configuration"
+  ]
+}

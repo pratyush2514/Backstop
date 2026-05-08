@@ -1,0 +1,62 @@
+---
+title: Approval endpoints
+description: REST endpoints for listing, approving, and denying pending queries.
+---
+
+import { ApiMethod } from "@/components/docs/mdx-components";
+
+The approval endpoints are REST (not JSON-RPC). They are used by operators — humans or automation — to review and act on queries held by the gateway.
+
+<ApiMethod method="GET" path="/pending" auth="approval:read scope">
+  Returns all queries currently awaiting a decision, sorted oldest-first.
+</ApiMethod>
+
+**Response:**
+```json
+{
+  "pending": [
+    {
+      "id": "appr_4f9e2c1a",
+      "agent_id": "cursor-local",
+      "sql": "DROP TABLE users",
+      "risk_level": "CRITICAL",
+      "snapshot_id": "snap_a3f9e2c1",
+      "snapshot_age_seconds": 45,
+      "safety_metadata": { ... },
+      "created_at": "2026-05-06T10:30:00Z"
+    }
+  ]
+}
+```
+
+---
+
+<ApiMethod method="POST" path="/approve/{id}" auth="approval:write scope">
+  Approves a pending query. The agent can now resubmit. Returns 200 on success, 404 if ID not found, 409 if already decided.
+</ApiMethod>
+
+**Request:** No body required.
+
+**Response:**
+```json
+{
+  "status": "approved",
+  "approval_id": "appr_4f9e2c1a",
+  "decided_at": "2026-05-06T10:31:00Z"
+}
+```
+
+---
+
+<ApiMethod method="POST" path="/deny/{id}" auth="approval:write scope">
+  Denies a pending query. The query is permanently rejected. Returns 200 on success.
+</ApiMethod>
+
+**Response:**
+```json
+{
+  "status": "denied",
+  "approval_id": "appr_4f9e2c1a",
+  "decided_at": "2026-05-06T10:31:30Z"
+}
+```

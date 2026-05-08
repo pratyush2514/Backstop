@@ -1,0 +1,223 @@
+---
+title: Docker Compose
+description: Run the full Backstop stack — gateway, sidecar, MinIO storage, and your database — with a single docker-compose up.
+---
+
+import { Callout, Steps, Step, Tabs, Tab } from "@/components/docs/mdx-components";
+
+The Backstop Docker Compose setup gives you a complete, reproducible environment: PostgreSQL, the Backstop gateway, the snapshot sidecar, and MinIO as an S3-compatible snapshot store — all wired together.
+
+## Minimal stack
+
+Start here for local development:
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mydb
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  backstop:
+    image: ghcr.io/pratyush2514/backstop-gateway:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BACKSTOP_DB_URL: postgresql://postgres:password@postgres:5432/mydb
+      BACKSTOP_STORAGE_URL: s3://snapshots@http://minio:9000
+      BACKSTOP_S3_ACCESS_KEY: minioadmin
+      BACKSTOP_S3_SECRET_KEY: minioadmin
+      BACKSTOP_TOKENS_INLINE: |
+        [
+          {"id":"agent","token":"dev-agent-token","scopes":["query:execute","query:analyze"]},
+          {"id":"ops","token":"dev-ops-token","scopes":["approval:read","approval:write","metadata:read"]},
+          {"id":"admin","token":"dev-admin-token","scopes":["admin:*","query:execute","query:analyze","approval:read","approval:write","metadata:read","metrics:read"]}
+        ]
+    ports:
+      - "8080:8080"
+
+volumes:
+  minio_data:
+```
+
+```bash
+docker-compose up -d
+# Gateway available at http://localhost:8080
+# MinIO console at http://localhost:9001
+```
+
+## Full production-like stack
+
+Adds the snapshot sidecar, WAL archiving, and a dedicated Prometheus scrape target:
+
+```yaml
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=backstop wal archive --storage s3://snapshots@http://minio:9000 --cluster-id local --wal-file %p --wal-name %f"
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mydb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
+
+  backstop:
+    image: ghcr.io/pratyush2514/backstop-gateway:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      BACKSTOP_DB_URL: postgresql://postgres:password@postgres:5432/mydb
+      BACKSTOP_STORAGE_URL: s3://snapshots@http://minio:9000
+      BACKSTOP_S3_ACCESS_KEY: minioadmin
+      BACKSTOP_S3_SECRET_KEY: minioadmin
+      BACKSTOP_TOKENS: /run/secrets/backstop_tokens
+      BACKSTOP_POLICY_CRITICAL: approve
+      BACKSTOP_POLICY_HIGH: approve
+    secrets:
+      - backstop_tokens
+    ports:
+      - "8080:8080"
+
+  backstop-sidecar:
+    image: ghcr.io/pratyush2514/backstop-sync:latest
+    depends_on:
+      - backstop
+    environment:
+      BACKSTOP_GATEWAY_URL: http://backstop:8080
+      BACKSTOP_SIDECAR_TOKEN: dev-sidecar-token
+      BACKSTOP_DB_URL: postgresql://postgres:password@postgres:5432/mydb
+      BACKSTOP_STORAGE_URL: s3://snapshots@http://minio:9000
+      BACKSTOP_S3_ACCESS_KEY: minioadmin
+      BACKSTOP_S3_SECRET_KEY: minioadmin
+      BACKSTOP_SNAPSHOT_INTERVAL: 300  # seconds
+
+secrets:
+  backstop_tokens:
+    file: ./tokens.json
+
+volumes:
+  pg_data:
+  minio_data:
+```
+
+## MinIO bucket setup
+
+MinIO needs a `snapshots` bucket before the gateway starts writing:
+
+```bash
+# Install mc (MinIO client)
+docker run --rm -it --network host \
+  minio/mc alias set local http://localhost:9000 minioadmin minioadmin
+
+docker run --rm -it --network host \
+  minio/mc mb local/snapshots
+```
+
+Or add a one-shot init container to your Compose file:
+
+```yaml
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/snapshots
+      "
+    restart: "no"
+```
+
+## Connecting from your application
+
+With the stack running, use these connection details:
+
+```bash
+# Gateway
+BACKSTOP_GATEWAY_URL=http://localhost:8080
+BACKSTOP_AGENT_TOKEN=dev-agent-token
+
+# Direct DB (only for migrations, never for agents)
+DATABASE_URL=postgresql://postgres:password@localhost:5432/mydb
+```
+
+<Callout type="danger" title="Never give agents the direct DATABASE_URL">
+  Point all AI agents at the Backstop gateway URL, not the database directly. The gateway's token controls what the agent can do — handing the agent the database URL bypasses all safety controls.
+</Callout>
+
+## Health checks
+
+```bash
+# Gateway
+curl http://localhost:8080/health
+
+# Detailed component health
+curl -H "Authorization: Bearer dev-admin-token" \
+  http://localhost:8080/metadata/health
+```
+
+## Stopping and cleaning up
+
+```bash
+# Stop without removing volumes (preserves DB and snapshots)
+docker-compose stop
+
+# Stop and remove everything including volumes
+docker-compose down -v
+```

@@ -1,0 +1,133 @@
+---
+title: Risk classification
+description: How Backstop classifies SQL into five risk levels using AST parsing, impact analysis, and table-level heuristics.
+---
+
+import { RiskBadge, PropertyTable } from "@/components/docs/mdx-components";
+
+Backstop classifies every SQL statement into one of five risk levels before applying policy. Classification happens at the AST level — the parser extracts the operation type, target, scope, and an impact estimate.
+
+## Risk levels
+
+### SAFE
+
+<RiskBadge level="SAFE" />
+
+Read-only and non-destructive operations. No data is modified, deleted, or altered.
+
+**Examples:** `SELECT`, `SHOW`, `SET`, `EXPLAIN`, `ANALYZE`, `VACUUM` (non-destructive), `EXPLAIN ANALYZE`
+
+**Default action:** Execute immediately, no approval required.
+
+---
+
+### LOW
+
+<RiskBadge level="LOW" />
+
+Write operations that are scoped and reversible. The operation targets specific rows and the affected set is bounded by a `WHERE` clause.
+
+**Examples:**
+- `INSERT INTO users (name, email) VALUES (...)` — bounded insertion
+- `UPDATE users SET name = 'Ana' WHERE id = 7` — scoped update
+- `DELETE FROM sessions WHERE expired = true` — scoped deletion
+
+**Default action:** Execute immediately, no approval required. Still audited.
+
+---
+
+### HIGH
+
+<RiskBadge level="HIGH" />
+
+Operations that affect an unbounded set of rows or alter schema in a recoverable way.
+
+**Examples:**
+- `UPDATE users SET name = 'Admin'` — no WHERE clause
+- `DELETE FROM logs` — no WHERE clause
+- `ALTER TABLE users ADD COLUMN metadata jsonb` — DDL, non-destructive
+- `CREATE INDEX CONCURRENTLY ...` — resource-intensive DDL
+
+**Default action:** Require approval. Snapshot taken if `require_recovery_for_critical` is true.
+
+---
+
+### IMPACT_CRITICAL
+
+<RiskBadge level="IMPACT_CRITICAL" />
+
+Operations where impact analysis estimates the affected row count or percentage exceeds your configured thresholds, even if the SQL itself would normally be `LOW`. Requires impact analysis to be enabled.
+
+**How it works:** Backstop estimates the row count or percentage of the table affected by the query using `pg_class.reltuples` and the presence of a WHERE clause. If either `max_write_rows_without_critical` or `max_write_percent_without_critical` is exceeded, the classification is escalated to `IMPACT_CRITICAL`.
+
+**Example:** A DELETE with a WHERE clause that still affects 80% of a large table.
+
+**Default action:** Require approval + snapshot.
+
+---
+
+### CRITICAL
+
+<RiskBadge level="CRITICAL" />
+
+Operations that are irreversible without a snapshot. These destroy data permanently at the table level.
+
+**Examples:**
+- `DROP TABLE users` — destroys table and all data
+- `TRUNCATE orders` — removes all rows, cannot be rolled back
+- `DELETE FROM payments` — unscoped delete of entire table
+- `ALTER TABLE users DROP COLUMN email` — destroys column data
+
+**Default action:** Require a verified snapshot + operator approval before execution.
+
+**Blocked by default:** `DROP DATABASE`, `DROP SCHEMA` — these cannot be snapshotted at table level.
+
+---
+
+## Impact analysis
+
+Impact analysis runs on `HIGH` and above when `impact_analysis_enabled: true`. It estimates:
+
+- **Estimated affected rows** — using `pg_class.reltuples` statistics
+- **Affected percent** — relative to the table's row count
+- **Protection check** — whether the target table or columns are in `protected_tables` / `protected_columns`
+
+If impact exceeds configured thresholds, the risk level is escalated. This catches the case where a `DELETE WITH WHERE` is technically scoped but still catastrophically large.
+
+```json
+{
+  "impact_analysis_enabled": true,
+  "max_write_rows_without_critical": 1000,
+  "max_write_percent_without_critical": 50
+}
+```
+
+## Classification response fields
+
+When Backstop classifies a query, the response includes a full `safety_metadata` object:
+
+```json
+{
+  "risk_level": "CRITICAL",
+  "operation": "DROP",
+  "table": "users",
+  "schema": "public",
+  "table_recoverable": true,
+  "recovery_required": true,
+  "recovery_possible": true,
+  "policy_action": "approve",
+  "policy_reason": "Risk level CRITICAL requires approval and snapshot",
+  "requires_approval": true,
+  "parse_error_present": false,
+  "estimated_affected_rows": 1842933,
+  "affected_percent": 100.0,
+  "protected_table": false,
+  "protected_columns": []
+}
+```
+
+## Parse failures
+
+If a SQL statement cannot be parsed, it is classified as `CRITICAL` (when `block_unknown_or_parse_failure: true`) or logged with a warning. The `parse_error_present` field is set to `true`.
+
+This prevents an attacker or misbehaving agent from bypassing classification by submitting malformed SQL that a regex-based classifier would miss.

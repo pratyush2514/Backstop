@@ -1,0 +1,143 @@
+---
+title: Python SDK
+description: Complete reference for the Backstop Python SDK — guard(), protect_engine(), modes, and integration patterns.
+---
+
+import { Callout, PropertyTable, Tabs, Tab } from "@/components/docs/mdx-components";
+
+The Python SDK wraps psycopg2 connections and SQLAlchemy engines with Backstop's interception layer. Your existing database code requires minimal changes.
+
+## Installation
+
+```bash
+pip install backstop
+# or
+uv add backstop
+# or
+pipx install backstop  # for CLI only
+```
+
+**Requirements:** Python 3.9+, psycopg2 or SQLAlchemy
+
+## guard() — psycopg2
+
+`guard()` wraps a raw psycopg2 connection and returns a `GuardedConnection` that intercepts all execute calls.
+
+```python
+import psycopg2
+import backstop
+
+raw_conn = psycopg2.connect(os.environ["DATABASE_URL"])
+
+db = backstop.guard(
+    conn=raw_conn,
+    storage="s3://prod-snapshots@http://localhost:9000",
+    actor="gpt-4-agent",
+    mode="protect",
+)
+
+# Use db exactly like a psycopg2 connection
+cursor = db.cursor()
+cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+rows = cursor.fetchall()
+
+db.commit()
+db.close()
+```
+
+### guard() parameters
+
+<PropertyTable properties={[
+  { name: "conn", type: "psycopg2.connection", required: true, description: "The raw psycopg2 connection to wrap. Backstop stores this internally and intercepts all cursor.execute() calls." },
+  { name: "storage", type: "string", required: true, description: "S3-compatible storage URL for snapshots. Format: s3://bucket@http://endpoint or s3://bucket for AWS S3." },
+  { name: "actor", type: "string", required: true, description: "A stable identifier for the agent or service. Used in audit logs and attribution. Should be consistent across sessions." },
+  { name: "mode", type: "string", required: false, default: '"protect"', description: "Enforcement mode: protect, monitor, or block. See modes below." }
+]} />
+
+### Modes
+
+| Mode | Behavior |
+|---|---|
+| `protect` | Snapshot CRITICAL operations, then execute. Snapshot failure does NOT block execution. |
+| `monitor` | Log all operations, classify risk, but always execute. No blocking. Use for observability only. |
+| `block` | Raise `PermissionError` on CRITICAL operations. Never execute destructive queries. |
+
+```python
+# Production — protect and snapshot
+db = backstop.guard(conn, storage="s3://...", actor="agent", mode="protect")
+
+# Staging — monitor only, don't block
+db = backstop.guard(conn, storage="s3://...", actor="agent", mode="monitor")
+
+# High-security — block all destructive queries
+db = backstop.guard(conn, storage="s3://...", actor="agent", mode="block")
+```
+
+## protect_engine() — SQLAlchemy
+
+`protect_engine()` wraps a SQLAlchemy engine. It intercepts queries at the DBAPI layer, before SQLAlchemy constructs them into SQL.
+
+```python
+from sqlalchemy import create_engine
+import backstop
+
+engine = create_engine(os.environ["DATABASE_URL"])
+
+protected = backstop.protect_engine(
+    engine=engine,
+    storage="s3://prod-snapshots@http://localhost:9000",
+    actor="langchain-agent",
+    mode="protect",
+)
+
+# Use protected exactly like a SQLAlchemy engine
+with protected.connect() as conn:
+    result = conn.execute(text("SELECT * FROM users"))
+```
+
+### Django integration
+
+```python
+# Use Backstop through Django's underlying psycopg2 connection
+from django.db import connection
+import backstop
+
+def guarded_cursor(actor: str):
+    raw = connection.connection
+    if raw is None:
+        connection.ensure_connection()
+        raw = connection.connection
+    return backstop.guard(
+        raw,
+        storage="s3://prod-snapshots",
+        actor=actor
+    ).cursor()
+
+# In a view or management command:
+cursor = guarded_cursor("django-management-command")
+cursor.execute("DELETE FROM stale_sessions WHERE expires_at < NOW()")
+```
+
+## Error handling
+
+The Python SDK does not expose the gateway's approval flow or typed policy exceptions. In local `block` mode, destructive operations raise `PermissionError`. In `protect` mode, snapshot failures are logged and the original query still executes.
+
+<Callout type="info" title="protect mode and snapshot failures">
+  In `protect` mode, if the snapshot fails (S3 unavailable, storage error), Backstop logs the failure and **still executes the query**. If you need human approval, scoped tokens, or recovery-readiness enforcement, route SQL through the gateway instead of relying only on the local Python SDK wrapper.
+</Callout>
+
+## RiskLevel enum
+
+```python
+from backstop import RiskLevel
+
+RiskLevel.SAFE            # "SAFE"
+RiskLevel.LOW             # "LOW"
+RiskLevel.HIGH            # "HIGH"
+RiskLevel.IMPACT_CRITICAL # "IMPACT_CRITICAL"
+RiskLevel.CRITICAL        # "CRITICAL"
+```
+
+## RiskResult
+
+`RiskResult` is the SDK's local parser result type. It is used internally by the guard layer to decide whether a snapshot is required and whether `block` mode should raise.

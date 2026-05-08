@@ -1,0 +1,90 @@
+---
+title: Production checklist
+description: Everything to verify before enabling Backstop in a production environment.
+---
+
+import { Callout, Steps, Step } from "@/components/docs/mdx-components";
+
+Run through this checklist before routing production traffic through the gateway. Each section maps to a specific failure mode we've seen in the field.
+
+## Connectivity and auth
+
+- [ ] Gateway is reachable from all agent hosts: `curl http://<gateway>/health`
+- [ ] Token file contains separate tokens for agents, operators, and admin (no shared tokens)
+- [ ] Agent tokens have only `query:execute` and `query:analyze` — no approval or admin scopes
+- [ ] `BACKSTOP_DEV_MODE` is **not** set in production environment
+- [ ] `dev-token` does not appear in production token file
+
+<Callout type="danger">
+  Run `curl -H "Authorization: Bearer dev-token" http://your-gateway/health` — if it returns 200, your token configuration is wrong. Fix it before going live.
+</Callout>
+
+## Storage and snapshots
+
+- [ ] S3 bucket exists and gateway can write to it: `backstop doctor storage-permissions --storage s3://your-bucket --strict`
+- [ ] Sidecar is running and heartbeat is fresh: check `sidecar_heartbeat_age_seconds` in `/metadata/health`
+- [ ] At least one snapshot exists for each table that agents will modify
+- [ ] Snapshot age is under your RTO threshold (typically `last_snapshot_age_seconds < 600`)
+
+```bash
+curl -H "Authorization: Bearer ops-token" \
+  http://localhost:8080/metadata/health
+```
+
+## Recovery drills
+
+Run all three drill types at least once before go-live. The production checklist is blocked until each returns clean.
+
+- [ ] WAL archive fetch drill passed: `backstop drill wal-archive-fetch --storage s3://... --cluster-id prod`
+- [ ] PITR prepare drill passed: `backstop drill pitr-prepare --storage s3://... --cluster-id prod --simulate`
+- [ ] Logical backup/restore drill passed: `backstop drill logical-backup-restore --source-db ... --target-db ...`
+
+```bash
+# All drills, JSON output for CI
+backstop drill wal-archive-fetch --storage s3://prod-snapshots --cluster-id prod --json
+backstop drill pitr-prepare --storage s3://prod-snapshots --cluster-id prod --simulate --json
+backstop drill logical-backup-restore \
+  --source-db postgresql://postgres@localhost:5432/mydb \
+  --target-db postgresql://postgres@localhost:5432/mydb_drill \
+  --storage s3://prod-snapshots --json
+```
+
+## Policy configuration
+
+- [ ] `BACKSTOP_POLICY_CRITICAL` is set to `approve` or `block` (not `execute`)
+- [ ] `BACKSTOP_POLICY_HIGH` is set appropriately for your risk tolerance
+- [ ] Protected tables list is correct — includes PII and financial data tables
+- [ ] Protected columns list covers sensitive fields (email, ssn, card_number, etc.)
+- [ ] Policy decisions have been tested against your expected query patterns
+
+## Approval workflow
+
+- [ ] At least one operator token is configured with `approval:read` and `approval:write` scope
+- [ ] Operators know how to check for pending approvals: `GET /pending`
+- [ ] Alert routing is configured (PagerDuty, Slack, or similar) so operators are notified of `approval_required` events
+- [ ] Approval SLA is defined — how long will agents wait before timing out?
+
+## Observability
+
+- [ ] Prometheus is scraping `/metrics` — verify with `curl http://<gateway>/metrics`
+- [ ] Audit log is queryable: `GET /metadata/audit` returns recent events
+- [ ] Alert on `sidecar_status != "healthy"` in your monitoring system
+- [ ] Alert on `last_snapshot_age_seconds > 900` (15 minutes)
+- [ ] Alert on any `risk_level: CRITICAL` event in audit log (for visibility even when approved)
+
+## Load and performance
+
+- [ ] Gateway has been load-tested at expected query rate
+- [ ] Database connection pool is sized correctly (gateway reuses connections)
+- [ ] Snapshot sidecar is not scheduled during peak query windows (snapshots lock tables briefly)
+
+## Incident response
+
+- [ ] Team knows the emergency pause command: `POST /admin/pause`
+- [ ] Emergency admin token is stored in a secrets manager (not in code or config files)
+- [ ] Runbook is written and accessible: see [Runbooks](/docs/operations/runbooks)
+- [ ] At least two people have been walked through a recovery drill
+
+<Callout type="info" title="Re-run after major changes">
+  Re-run the storage and recovery drill checks after any change to: database schema, S3 bucket configuration, policy file, or token configuration. These are not one-time checks.
+</Callout>

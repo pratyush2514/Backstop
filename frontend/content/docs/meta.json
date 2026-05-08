@@ -1,0 +1,14 @@
+{
+  "title": "Backstop Docs",
+  "pages": [
+    "getting-started",
+    "concepts",
+    "sdks",
+    "mcp",
+    "cli",
+    "api-reference",
+    "integrations",
+    "operations",
+    "security"
+  ]
+}
