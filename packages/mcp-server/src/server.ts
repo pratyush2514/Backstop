@@ -13,7 +13,7 @@ export function createBackstopMcpServer(client: BackstopClient, config: Backstop
   const server = new McpServer(
     {
       name: "backstop",
-      version: "0.1.0-alpha.0",
+      version: "0.1.0-alpha.1",
     },
     {
       instructions:

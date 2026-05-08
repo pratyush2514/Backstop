@@ -1,6 +1,6 @@
 {
   "name": "@backstop/client",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "TypeScript/Node client for the backstop gateway.",
   "type": "module",
   "license": "Apache-2.0",

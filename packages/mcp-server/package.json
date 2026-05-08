@@ -1,6 +1,6 @@
 {
   "name": "@backstop/mcp-server",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "MCP server for safe AI-agent database access through backstop.",
   "type": "module",
   "license": "Apache-2.0",
@@ -44,7 +44,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@backstop/client": "0.1.0-alpha.0",
+    "@backstop/client": "0.1.0-alpha.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^3.25.0"
   },
