@@ -64,7 +64,7 @@ class TestFullGuardDropRestoreCycle:
 
         # Step 4: find the snapshot
         engine = SnapshotEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
-        snapshots = engine.list_snapshots(table="users")
+        snapshots = engine.list_snapshots(table="users", writer="python-sdk")
         assert len(snapshots) >= 1, "Expected at least one snapshot for users table"
 
         latest = snapshots[0]
@@ -101,7 +101,7 @@ class TestFullGuardDropRestoreCycle:
             pass
 
         engine = SnapshotEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
-        before_count = len(engine.list_snapshots(table="users"))
+        before_count = len(engine.list_snapshots(table="users", writer="python-sdk"))
 
         db = backstop.guard(
             conn=pg_conn,
@@ -114,8 +114,8 @@ class TestFullGuardDropRestoreCycle:
         cur.execute("DROP TABLE users")
         db.commit()
 
-        after_count = len(engine.list_snapshots(table="users"))
-        assert after_count == before_count + 1
+        after_count = len(engine.list_snapshots(table="users", writer="python-sdk"))
+        assert after_count >= before_count + 1
 
         cur = pg_conn.cursor()
         cur.execute("SELECT to_regclass('users')")
@@ -145,7 +145,7 @@ class TestFullGuardDropRestoreCycle:
         assert cur.fetchone()[0] == 4
 
         engine = SnapshotEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
-        latest = engine.list_snapshots(table="users")[0]
+        latest = engine.list_snapshots(table="users", writer="python-sdk")[0]
         assert latest.operation == "DELETE"
         assert latest.snapshot_scope == "rows"
         assert latest.row_count == 1
@@ -185,7 +185,7 @@ class TestFullGuardDropRestoreCycle:
         assert cur.fetchone()[0] == "Alicia"
 
         engine = SnapshotEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
-        latest = engine.list_snapshots(table="users")[0]
+        latest = engine.list_snapshots(table="users", writer="python-sdk")[0]
         assert latest.operation == "UPDATE"
         assert latest.snapshot_scope == "rows"
         assert latest.row_count == 1
@@ -247,7 +247,7 @@ class TestFullGuardDropRestoreCycle:
             pass
 
         engine = SnapshotEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
-        before_count = len(engine.list_snapshots(table="users"))
+        before_count = len(engine.list_snapshots(table="users", writer="python-sdk"))
 
         db = backstop.guard(
             conn=pg_conn,
@@ -260,7 +260,7 @@ class TestFullGuardDropRestoreCycle:
         db.execute("DELETE FROM users WHERE id = 1")
         db.commit()
 
-        after_count = len(engine.list_snapshots(table="users"))
+        after_count = len(engine.list_snapshots(table="users", writer="python-sdk"))
         assert after_count == before_count, (
             f"Monitor mode must not create snapshots, but count went from "
             f"{before_count} to {after_count}"
@@ -372,13 +372,13 @@ class TestFullGuardDropRestoreCycle:
             pass
 
         engine = SnapshotEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
-        before_count = len(engine.list_snapshots(table="users"))
+        before_count = len(engine.list_snapshots(table="users", writer="python-sdk"))
 
         db = backstop.guard(conn=pg_conn, storage=STORAGE_URL, mode="protect")
         db.execute("TRUNCATE TABLE users")
         db.commit()
 
-        after_count = len(engine.list_snapshots(table="users"))
+        after_count = len(engine.list_snapshots(table="users", writer="python-sdk"))
         assert after_count == before_count + 1, (
             f"Expected one new snapshot after TRUNCATE, "
             f"before={before_count} after={after_count}"

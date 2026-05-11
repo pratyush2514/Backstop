@@ -42,10 +42,14 @@ BACKSTOP_MCP_MODE=operator
 Modes:
 
 - `agent`: execute/analyze/status, no approval tools.
-- `operator`: approve/deny/audit/alerts, no SQL execution.
+- `operator`: approve/deny/audit/alerts/restore plans, no SQL execution.
 - `readonly`: analyze/status/audit/alerts only.
 - `admin`: all tools, including emergency pause/resume.
 
 `BACKSTOP_MCP_ENABLE_APPROVAL_TOOLS=true` is kept for compatibility and maps to
 `operator` when `BACKSTOP_MCP_MODE` is not set.
+
+Operator/admin mode also exposes `backstop_prepare_restore_snapshot`. It returns
+a secret-safe CLI restore plan that uses `BACKSTOP_RESTORE_DB`; the MCP server
+never sends the raw PostgreSQL password back to the AI client.
 

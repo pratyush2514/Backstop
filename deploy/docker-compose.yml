@@ -4,8 +4,10 @@ services:
       context: ..
       dockerfile: deploy/postgres/Dockerfile
     depends_on:
-      - minio
-      - create-bucket
+      minio:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
     environment:
       POSTGRES_DB: testdb
       POSTGRES_USER: postgres
@@ -22,10 +24,16 @@ services:
       - -c
       - archive_command=backstop wal archive --storage s3://backstop-test@http://minio:9000 --cluster-id local --wal-file %p --wal-name %f
     ports:
-      - "5433:5432"
+      - "${BACKSTOP_POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./seed.sql:/seed/seed.sql:ro
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
   minio:
     image: quay.io/minio/minio:latest
@@ -34,15 +42,22 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${BACKSTOP_MINIO_HOST_PORT:-9000}:9000"
+      - "${BACKSTOP_MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
 
   create-bucket:
     image: quay.io/minio/mc:latest
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 2; done &&
@@ -53,9 +68,12 @@ services:
     build:
       context: ../sync
     depends_on:
-      - postgres
-      - minio
-      - create-bucket
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -81,16 +99,31 @@ services:
       - postgres
       - --gateway-application-name
       - backstop-gateway
+      - --snapshot-startup-grace
+      - 20s
+      - --snapshot-stable-polls
+      - "2"
     ports:
-      - "9091:9091"
+      - "${BACKSTOP_SYNC_HOST_PORT:-9091}:9091"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/backstop-sync", "--healthcheck", "http://localhost:9091/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   backstop-gateway:
     build:
       context: ../gateway
     depends_on:
-      - postgres
-      - minio
-      - create-bucket
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+      backstop-sync:
+        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
@@ -114,11 +147,16 @@ services:
       - --metadata-db
       - /metadata/backstop.db
     ports:
-      - "8080:8080"
+      - "${BACKSTOP_GATEWAY_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/backstop-gateway", "--healthcheck", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
 volumes:
   postgres-data:
   minio-data:
   gateway-audit:
   backstop-metadata:
-

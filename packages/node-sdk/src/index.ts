@@ -32,6 +32,8 @@ export type {
   ListSnapshotsOptions,
   PolicyAction,
   RequestOptions,
+  RestoreSnapshotOptions,
+  RestoreSnapshotPlan,
   RiskLevel,
   SafetyMetadata,
 } from "./types.js";

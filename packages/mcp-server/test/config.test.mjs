@@ -70,12 +70,16 @@ test("explicit MCP mode overrides legacy approval flag", () => {
 test("MCP mode profiles split execution and approval capabilities", () => {
   assert.equal(modeAllows("agent", "execute"), true);
   assert.equal(modeAllows("agent", "approvalWrite"), false);
+  assert.equal(modeAllows("agent", "restorePrepare"), false);
   assert.equal(modeAllows("operator", "execute"), false);
   assert.equal(modeAllows("operator", "approvalWrite"), true);
+  assert.equal(modeAllows("operator", "restorePrepare"), true);
   assert.equal(modeAllows("readonly", "execute"), false);
   assert.equal(modeAllows("readonly", "approvalWrite"), false);
+  assert.equal(modeAllows("readonly", "restorePrepare"), false);
   assert.equal(modeAllows("admin", "execute"), true);
   assert.equal(modeAllows("admin", "approvalWrite"), true);
+  assert.equal(modeAllows("admin", "restorePrepare"), true);
 });
 
 test("jsonToolResult returns MCP text content with formatted JSON", () => {

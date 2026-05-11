@@ -1,30 +1,31 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestSendDropAlertIncludesRecoveryPoint(t *testing.T) {
 	var payload webhookPayload
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	alerter := NewAlertEngine("http://backstop.test/alert")
+	alerter.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer server.Close()
+		return jsonResponse(http.StatusAccepted), nil
+	})}
 
-	alerter := NewAlertEngine(server.URL)
 	manifest := &SnapshotManifest{
 		SnapshotID:    "snap_1234abcd",
 		RowCount:      42,
@@ -50,15 +51,14 @@ func TestSendDropAlertIncludesRecoveryPoint(t *testing.T) {
 
 func TestSendDropAlertWithoutRecoveryPoint(t *testing.T) {
 	var payload webhookPayload
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	alerter := NewAlertEngine("http://backstop.test/alert")
+	alerter.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+		return jsonResponse(http.StatusOK), nil
+	})}
 
-	alerter := NewAlertEngine(server.URL)
 	if err := alerter.SendDropAlert(context.Background(), "users", nil); err != nil {
 		t.Fatalf("SendDropAlert returned error: %v", err)
 	}
@@ -67,6 +67,20 @@ func TestSendDropAlertWithoutRecoveryPoint(t *testing.T) {
 	}
 	if payload.SnapshotID != "" || payload.ManifestKey != "" || payload.Rows != 0 {
 		t.Fatalf("unexpected recovery payload: %+v", payload)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func jsonResponse(status int) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(nil)),
 	}
 }
 
@@ -117,7 +131,7 @@ func TestMetadataStoreRecordsSnapshot(t *testing.T) {
 	}
 	defer store.Close()
 
-	store.RecordSnapshot(context.Background(), SnapshotManifest{
+	if err := store.RecordSnapshot(context.Background(), SnapshotManifest{
 		SnapshotID:    "snap_1234abcd",
 		TableName:     "users",
 		Writer:        sidecarWriter,
@@ -125,7 +139,9 @@ func TestMetadataStoreRecordsSnapshot(t *testing.T) {
 		RowCount:      2,
 		S3ManifestKey: "backstop/snapshots/users/snap_1234abcd/manifest.json",
 		Timestamp:     "2026-05-01T00:00:00Z",
-	})
+	}); err != nil {
+		t.Fatalf("record snapshot: %v", err)
+	}
 
 	var rows sql.NullInt64
 	if err := store.db.QueryRow("SELECT row_count FROM snapshots WHERE snapshot_id = ?", "snap_1234abcd").Scan(&rows); err != nil {
@@ -133,6 +149,54 @@ func TestMetadataStoreRecordsSnapshot(t *testing.T) {
 	}
 	if !rows.Valid || rows.Int64 != 2 {
 		t.Fatalf("row_count = %+v", rows)
+	}
+}
+
+func TestMetadataStoreConcurrentWritesAreTransactional(t *testing.T) {
+	store, err := OpenMetadataStore(t.TempDir() + "/backstop.db")
+	if err != nil {
+		t.Fatalf("open metadata: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	const writers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*2)
+	for i := 0; i < writers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			manifest := SnapshotManifest{
+				SnapshotID:    "snap_concurrent_" + int64String(int64(i)),
+				TableName:     "users",
+				Writer:        sidecarWriter,
+				SnapshotScope: "table",
+				RowCount:      i,
+				S3ManifestKey: "backstop/snapshots/users/snap_concurrent/manifest.json",
+				Timestamp:     "2026-05-01T00:00:00Z",
+				Status:        "valid",
+			}
+			if err := store.RecordSnapshot(ctx, manifest); err != nil {
+				errs <- err
+			}
+			if err := store.RecordHealth(ctx, "sync", "healthy", map[string]any{"writer": i}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent metadata write failed: %v", err)
+	}
+	var count int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM snapshots WHERE table_name = ?", "users").Scan(&count); err != nil {
+		t.Fatalf("count snapshots: %v", err)
+	}
+	if count != writers {
+		t.Fatalf("snapshot rows = %d, want %d", count, writers)
 	}
 }
 
@@ -169,3 +233,20 @@ func TestSyncMetricsIncludesBypassPosture(t *testing.T) {
 	}
 }
 
+func TestSyncMetricsHealthIsExplicitReadinessState(t *testing.T) {
+	metrics := NewSyncMetrics()
+	if got := metrics.Health().Status; got != "starting" {
+		t.Fatalf("initial health = %q, want starting", got)
+	}
+	metrics.SetHealth("degraded", map[string]any{"missing": []string{"users"}})
+	snapshot := metrics.Health()
+	if snapshot.Status != "degraded" {
+		t.Fatalf("health = %q, want degraded", snapshot.Status)
+	}
+	if !strings.Contains(string(healthJSON(snapshot)), `"status":"degraded"`) {
+		t.Fatalf("health JSON missing degraded status: %s", healthJSON(snapshot))
+	}
+	if !strings.Contains(metrics.Prometheus(time.Now()), `backstop_sync_health{status="degraded"} 1`) {
+		t.Fatalf("prometheus health gauge missing degraded state")
+	}
+}

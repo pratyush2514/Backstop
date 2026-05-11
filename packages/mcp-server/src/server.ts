@@ -75,6 +75,30 @@ export function createBackstopMcpServer(client: BackstopClient, config: Backstop
     async (args) => jsonToolResult(await client.listSnapshots({ table: args.table })),
   );
 
+  if (modeAllows(config.mode, "restorePrepare")) {
+    server.registerTool(
+      "backstop_prepare_restore_snapshot",
+      {
+        title: "Prepare Snapshot Restore",
+        description:
+          "Prepare a secret-safe Backstop CLI restore plan for a snapshot. This never returns raw database credentials.",
+        inputSchema: {
+          snapshot_id: z.string().min(1).describe("Snapshot ID to restore"),
+          table: z.string().min(1).describe("Original table name captured by the snapshot"),
+          target_table: z.string().min(1).optional().describe("Optional target table. Defaults to {table}_recovered"),
+          agent_id: optionalAgentId,
+        },
+      },
+      async (args) =>
+        jsonToolResult(
+          await client.prepareRestoreSnapshot(args.snapshot_id, args.table, {
+            targetTable: args.target_table,
+            agentId: agentIdFor(config, args.agent_id),
+          }),
+        ),
+    );
+  }
+
   server.registerTool(
     "backstop_get_safety_status",
     {
@@ -200,13 +224,14 @@ export function createBackstopMcpServer(client: BackstopClient, config: Backstop
   return server;
 }
 
-export type McpCapability = "execute" | "approvalRead" | "approvalWrite";
+export type McpCapability = "execute" | "approvalRead" | "approvalWrite" | "restorePrepare";
 
 export function modeAllows(mode: BackstopMcpConfig["mode"], capability: McpCapability): boolean {
   if (mode === "admin") return true;
   if (capability === "execute") return mode === "agent";
   if (capability === "approvalRead") return mode === "operator";
   if (capability === "approvalWrite") return mode === "operator";
+  if (capability === "restorePrepare") return mode === "operator";
   return false;
 }
 

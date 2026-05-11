@@ -11,6 +11,20 @@ import (
 	"time"
 )
 
+const maxInMemoryAuditEntries = 10000
+
+var secretScrubbers = []struct {
+	pattern *regexp.Regexp
+	value   string
+}{
+	{regexp.MustCompile(`://([^:\s/]+):([^@\s]+)@`), `://$1:***@`},
+	{regexp.MustCompile(`(?i)(password\s*)'[^']*'`), `${1}'***'`},
+	{regexp.MustCompile(`(?i)(password\s*=\s*)'[^']*'`), `${1}'***'`},
+	{regexp.MustCompile(`(?i)(password\s*=\s*)\S+`), `${1}***`},
+	{regexp.MustCompile(`(?i)(aws_secret_access_key\s*=\s*)\S+`), `${1}***`},
+	{regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`), `${1}***`},
+}
+
 // AuditEntry represents a single audited query event for an agent.
 type AuditEntry struct {
 	AgentID     string    `json:"agent_id"`
@@ -81,6 +95,7 @@ func (r *AgentRegistry) loadAuditLog() error {
 	}
 
 	r.entries = append(r.entries, loaded...)
+	r.trimLocked()
 	return nil
 }
 
@@ -114,30 +129,33 @@ func (r *AgentRegistry) RecordDetailed(agentID, query, riskLevel string, approve
 	}
 	r.mu.Lock()
 	r.entries = append(r.entries, entry)
+	r.trimLocked()
 	if r.auditPath != "" {
 		if err := r.appendAuditLog(entry); err != nil {
 			log.Printf("backstop-gateway: failed to append audit log %s: %v", r.auditPath, err)
 		}
 	}
 	if r.metadata != nil {
-		r.metadata.RecordAudit(context.Background(), entry)
+		if err := r.metadata.RecordAudit(context.Background(), entry); err != nil {
+			log.Printf("backstop-gateway: failed to persist audit metadata: %v", err)
+		}
 	}
 	r.mu.Unlock()
 }
 
-func (r *AgentRegistry) RecordApprovalRequested(ctx context.Context, details ApprovalDetails) {
+func (r *AgentRegistry) RecordApprovalRequested(ctx context.Context, details ApprovalDetails) error {
 	if r == nil || r.metadata == nil {
-		return
+		return nil
 	}
 	details.Query = scrubSecrets(details.Query)
-	r.metadata.RecordApprovalRequested(ctx, details)
+	return r.metadata.RecordApprovalRequested(ctx, details)
 }
 
-func (r *AgentRegistry) RecordApprovalResolved(ctx context.Context, approvalID, status, actor string) {
+func (r *AgentRegistry) RecordApprovalResolved(ctx context.Context, approvalID, status, actor string) error {
 	if r == nil || r.metadata == nil {
-		return
+		return nil
 	}
-	r.metadata.RecordApprovalResolved(ctx, approvalID, status, actor)
+	return r.metadata.RecordApprovalResolved(ctx, approvalID, status, actor)
 }
 
 // GetHistory returns all audit entries for the given agentID.
@@ -168,22 +186,20 @@ func (r *AgentRegistry) AllEntries() []AuditEntry {
 	return out
 }
 
-func scrubSecrets(value string) string {
-	replacements := []struct {
-		pattern *regexp.Regexp
-		value   string
-	}{
-		{regexp.MustCompile(`://([^:\s/]+):([^@\s]+)@`), `://$1:***@`},
-		{regexp.MustCompile(`(?i)(password\s*)'[^']*'`), `${1}'***'`},
-		{regexp.MustCompile(`(?i)(password\s*=\s*)'[^']*'`), `${1}'***'`},
-		{regexp.MustCompile(`(?i)(password\s*=\s*)\S+`), `${1}***`},
-		{regexp.MustCompile(`(?i)(aws_secret_access_key\s*=\s*)\S+`), `${1}***`},
-		{regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`), `${1}***`},
+func (r *AgentRegistry) trimLocked() {
+	if len(r.entries) <= maxInMemoryAuditEntries {
+		return
 	}
+	start := len(r.entries) - maxInMemoryAuditEntries
+	trimmed := make([]AuditEntry, maxInMemoryAuditEntries)
+	copy(trimmed, r.entries[start:])
+	r.entries = trimmed
+}
+
+func scrubSecrets(value string) string {
 	out := value
-	for _, replacement := range replacements {
+	for _, replacement := range secretScrubbers {
 		out = replacement.pattern.ReplaceAllString(out, replacement.value)
 	}
 	return out
 }
-

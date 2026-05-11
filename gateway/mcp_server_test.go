@@ -99,6 +99,17 @@ func TestAnalyzeQueryToolDoesNotExecuteOrAudit(t *testing.T) {
 	}
 }
 
+func TestExecuteQueryRejectsWhitespaceOnlySQL(t *testing.T) {
+	server := NewMCPServer(NewApprovalEngine(time.Second), NewAgentRegistry(), "", nil, "", "", false, nil)
+	resp := server.toolExecuteQuery(context.Background(), 1, []byte(`{"query":"   ","agent_id":"agent-1"}`))
+	if resp.Error == nil {
+		t.Fatalf("expected validation error, got %+v", resp.Result)
+	}
+	if !strings.Contains(resp.Error.Message, "query is required") {
+		t.Fatalf("error = %+v", resp.Error)
+	}
+}
+
 func TestImpactCriticalWriteKeepsTableRecoverable(t *testing.T) {
 	analysis := applyImpactAnalysis(
 		analyzeSQL("DELETE FROM users WHERE id > 0"),
@@ -126,7 +137,7 @@ func TestImpactCriticalWriteKeepsTableRecoverable(t *testing.T) {
 	}
 }
 
-func TestRestoreSnapshotReturnsPythonCLICommand(t *testing.T) {
+func TestRestoreSnapshotReturnsSecretSafeRestorePlan(t *testing.T) {
 	server := NewMCPServer(
 		NewApprovalEngine(time.Second),
 		NewAgentRegistry(),
@@ -152,12 +163,15 @@ func TestRestoreSnapshotReturnsPythonCLICommand(t *testing.T) {
 	if !ok {
 		t.Fatalf("restore_command missing from result: %+v", result)
 	}
+	if strings.Contains(command, "postgres:password") || strings.Contains(command, "localhost:5433") {
+		t.Fatalf("restore command leaked database URL: %q", command)
+	}
 	for _, want := range []string{
 		"backstop restore",
-		"--db postgresql://postgres:password@localhost:5433/testdb",
-		"--storage s3://backstop-test@http://localhost:9000",
-		"--snapshot-id snap_1234abcd",
-		"--table users",
+		"--db \"$BACKSTOP_RESTORE_DB\"",
+		"s3://backstop-test@http://localhost:9000",
+		"snap_1234abcd",
+		"users",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("restore command %q missing %q", command, want)
@@ -265,4 +279,3 @@ func TestToolsListDoesNotRequireDBURLArgument(t *testing.T) {
 		t.Fatalf("execute_query should not require db_url when gateway can be configured with --db: %s", raw)
 	}
 }
-

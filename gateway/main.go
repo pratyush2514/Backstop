@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,9 +22,9 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// generateID returns a random prefixed ID, e.g. "appr_3f9a1b2c".
+// generateID returns a random prefixed ID, e.g. "appr_3f9a1b2c...".
 func generateID(prefix string) string {
-	b := make([]byte, 4)
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		// Fallback to timestamp-based ID on rand failure (should never happen).
 		return fmt.Sprintf("%s_%x", prefix, time.Now().UnixNano())
@@ -32,11 +33,18 @@ func generateID(prefix string) string {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "--healthcheck" {
+		if err := runHTTPHealthcheck(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	listen := flag.String("listen", ":8080", "TCP address to listen on")
 	approvalTimeout := flag.Duration("approval-timeout", 300*time.Second, "How long to wait for human approval before auto-denying")
 	alertWebhook := flag.String("alert-webhook", "", "Optional webhook URL for risk alerts")
-	dbURL := flag.String("db", "", "Default PostgreSQL connection string used by execute_query and restore command output")
-	storage := flag.String("storage", "", "S3 storage URL used for restore command output")
+	dbURL := flag.String("db", "", "Default PostgreSQL connection string used by execute_query")
+	storage := flag.String("storage", "", "S3 storage URL used for snapshot verification and restore planning")
 	snapshotBeforeCritical := flag.Bool("snapshot-before-critical", true, "Require a sidecar snapshot_id before executing approved CRITICAL queries")
 	auditLog := flag.String("audit-log", os.Getenv("BACKSTOP_GATEWAY_AUDIT_LOG"), "Optional JSONL audit log path for durable gateway audit history")
 	authToken := flag.String("auth-token", os.Getenv("BACKSTOP_GATEWAY_AUTH_TOKEN"), "Bearer token required for MCP, approval, pending, audit, metadata, and metrics endpoints")
@@ -46,6 +54,7 @@ func main() {
 	allowInsecureNoAuth := flag.Bool("allow-insecure-no-auth", false, "Explicitly allow unauthenticated protected endpoints for local development only")
 	requireAuthFlag := flag.Bool("require-auth", true, "Require auth for protected endpoints")
 	metricsPublic := flag.Bool("metrics-public", false, "Expose /metrics without authentication")
+	maxConcurrentRequests := flag.Int("max-concurrent-requests", 64, "Maximum concurrent protected HTTP requests before returning 429")
 	environment := flag.String("environment", getenvDefault("BACKSTOP_ENVIRONMENT", "local"), "Environment label recorded in safety metadata, audit, approvals, and alerts")
 	clusterID := flag.String("cluster-id", getenvDefault("BACKSTOP_CLUSTER_ID", "local"), "Cluster label recorded in safety metadata, audit, approvals, and alerts")
 	pauseFile := flag.String("pause-file", os.Getenv("BACKSTOP_PAUSE_FILE"), "Optional JSON file used to persist emergency pause state")
@@ -66,6 +75,7 @@ func main() {
 	var db *sql.DB
 	var verifier SnapshotVerifier
 	if *dbURL != "" {
+		*dbURL = ensurePostgresApplicationName(*dbURL, "backstop-gateway")
 		var err error
 		db, err = sql.Open("postgres", *dbURL)
 		if err != nil {
@@ -100,7 +110,12 @@ func main() {
 		log.Fatalf("backstop-gateway: failed to open metadata DB: %v", err)
 	}
 	defer metadata.Close()
-	metadata.RecordHealth(context.Background(), "gateway", "starting", map[string]any{"listen": *listen})
+	if err := metadata.RecordHealth(context.Background(), "gateway", "starting", map[string]any{"listen": *listen}); err != nil {
+		log.Fatalf("backstop-gateway: failed to record startup health: %v", err)
+	}
+	if s3Verifier, ok := verifier.(*S3SnapshotVerifier); ok {
+		s3Verifier.SetMetadataStore(metadata)
+	}
 
 	approval := NewApprovalEngine(*approvalTimeout)
 	registry := NewAgentRegistryWithStores(*auditLog, metadata)
@@ -119,7 +134,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("POST /", requireScopedAuth(auth, metadata, mcp.metrics, "", makeMCPHandler(mcp)))
+	mux.HandleFunc("POST /", limitConcurrent(*maxConcurrentRequests, requireScopedAuth(auth, metadata, mcp.metrics, "", makeMCPHandler(mcp))))
 	mux.HandleFunc("POST /approve/{id}", requireScopedAuth(auth, metadata, mcp.metrics, "approval:write", makeApproveHandler(approval, true)))
 	mux.HandleFunc("POST /deny/{id}", requireScopedAuth(auth, metadata, mcp.metrics, "approval:write", makeApproveHandler(approval, false)))
 	mux.HandleFunc("GET /pending", requireScopedAuth(auth, metadata, mcp.metrics, "approval:read", makePendingHandler(approval)))
@@ -186,7 +201,9 @@ func main() {
 
 	<-quit
 	log.Println("backstop-gateway: shutting down…")
-	metadata.RecordHealth(context.Background(), "gateway", "stopping", map[string]any{"listen": *listen})
+	if err := metadata.RecordHealth(context.Background(), "gateway", "stopping", map[string]any{"listen": *listen}); err != nil {
+		log.Printf("backstop-gateway: failed to record stopping health: %v", err)
+	}
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -201,6 +218,22 @@ func getenvDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func ensurePostgresApplicationName(dbURL, applicationName string) string {
+	if strings.TrimSpace(dbURL) == "" || strings.TrimSpace(applicationName) == "" {
+		return dbURL
+	}
+	parsed, err := url.Parse(dbURL)
+	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") {
+		return dbURL
+	}
+	values := parsed.Query()
+	if values.Get("application_name") == "" {
+		values.Set("application_name", applicationName)
+		parsed.RawQuery = values.Encode()
+	}
+	return parsed.String()
 }
 
 func validateAuthConfig(requireAuth, allowInsecure bool, token, tokenFile string) error {
@@ -225,6 +258,36 @@ func waitForDB(ctx context.Context, db *sql.DB) error {
 		case <-ctx.Done():
 			return fmt.Errorf("%w: %v", ctx.Err(), lastErr)
 		case <-ticker.C:
+		}
+	}
+}
+
+func runHTTPHealthcheck(url string) error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("healthcheck failed: %s", resp.Status)
+	}
+	return nil
+}
+
+func limitConcurrent(max int, next http.HandlerFunc) http.HandlerFunc {
+	if max <= 0 {
+		return next
+	}
+	sem := make(chan struct{}, max)
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next(w, r)
+		default:
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many concurrent requests"})
 		}
 	}
 }
@@ -398,7 +461,8 @@ func makeGatewayMetricsHandler(metrics *GatewayMetrics) http.HandlerFunc {
 
 func makeMetadataSnapshotsHandler(metadata *MetadataStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := metadata.QuerySnapshots(r.Context(), r.URL.Query().Get("table"))
+		latestValidOnly := r.URL.Query().Get("latest") == "valid" || r.URL.Query().Get("latest_valid") == "true"
+		rows, err := metadata.QuerySnapshots(r.Context(), r.URL.Query().Get("table"), latestValidOnly)
 		writeMetadataResponse(w, rows, err)
 	}
 }
@@ -443,4 +507,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		log.Printf("backstop-gateway: json encode error: %v", err)
 	}
 }
-

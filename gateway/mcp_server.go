@@ -61,16 +61,16 @@ type analyzeQueryParams struct {
 }
 
 type restoreSnapshotParams struct {
-	SnapshotID string `json:"snapshot_id"`
-	Table      string `json:"table"`
-	AgentID    string `json:"agent_id"`
+	SnapshotID  string `json:"snapshot_id"`
+	Table       string `json:"table"`
+	TargetTable string `json:"target_table"`
+	AgentID     string `json:"agent_id"`
 }
 
 // ---- Risk levels --------------------------------------------------------
 
 const (
 	RiskSafe           = "SAFE"
-	RiskLow            = "LOW"
 	RiskHigh           = "HIGH"
 	RiskImpactCritical = "IMPACT_CRITICAL"
 	RiskCritical       = "CRITICAL"
@@ -117,14 +117,15 @@ func builtinTools() []toolDef {
 			},
 		},
 		{
-			Name:        "restore_snapshot",
-			Description: "Restore a previously captured backstop snapshot to the database.",
+			Name:        "prepare_restore_snapshot",
+			Description: "Prepare a restore plan for a previously captured Backstop snapshot. The gateway never returns database passwords; run the Backstop CLI with your local DB URL to perform the restore.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"snapshot_id": map[string]any{"type": "string", "description": "Snapshot ID (snap_xxxx)"},
-					"table":       map[string]any{"type": "string", "description": "Original table name"},
-					"agent_id":    map[string]any{"type": "string", "description": "Identifier for the calling agent"},
+					"snapshot_id":  map[string]any{"type": "string", "description": "Snapshot ID (snap_xxxx)"},
+					"table":        map[string]any{"type": "string", "description": "Original table name"},
+					"target_table": map[string]any{"type": "string", "description": "Optional restore target table. Defaults to {table}_recovered"},
+					"agent_id":     map[string]any{"type": "string", "description": "Identifier for the calling agent"},
 				},
 				"required": []string{"snapshot_id", "table", "agent_id"},
 			},
@@ -235,7 +236,7 @@ func (s *MCPServer) handleToolsCall(ctx context.Context, req MCPRequest) MCPResp
 			return errorResponse(req.ID, rpcInvalidRequest, "forbidden: query:analyze scope is required")
 		}
 		return s.toolAnalyzeQuery(ctx, req.ID, wrapper.Arguments)
-	case "restore_snapshot":
+	case "prepare_restore_snapshot", "restore_snapshot":
 		if !s.contextHasScope(ctx, "restore:prepare") {
 			return errorResponse(req.ID, rpcInvalidRequest, "forbidden: restore:prepare scope is required")
 		}
@@ -289,7 +290,7 @@ func (s *MCPServer) toolExecuteQuery(ctx context.Context, id any, rawArgs json.R
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return errorResponse(id, rpcInvalidParams, "invalid arguments: "+err.Error())
 	}
-	if args.Query == "" {
+	if strings.TrimSpace(args.Query) == "" {
 		return errorResponse(id, rpcInvalidParams, "query is required")
 	}
 	if args.AgentID == "" {
@@ -402,7 +403,19 @@ func (s *MCPServer) toolExecuteQuery(ctx context.Context, id any, rawArgs json.R
 			ClusterID:   s.clusterID,
 			SnapshotID:  args.SnapshotID,
 		}
-		s.registry.RecordApprovalRequested(ctx, details)
+		if err := s.registry.RecordApprovalRequested(ctx, details); err != nil {
+			s.registry.RecordDetailed(args.AgentID, args.Query, risk, false, querySHA, s.environment, s.clusterID)
+			s.metrics.IncQuery(risk, "blocked")
+			s.metrics.IncBlock("metadata_write_failed")
+			s.emitAlert(ctx, "critical", "approval_metadata_write_failed", args.AgentID, analysis, querySHA, approvalID, args.SnapshotID, "Treat recovery state as ambiguous; repair metadata storage before approving destructive operations.", err.Error())
+			return okResponse(id, map[string]any{
+				"status":          "blocked",
+				"approval_id":     approvalID,
+				"risk_level":      risk,
+				"safety_metadata": s.safetyMetadata(analysis, decision),
+				"message":         "Approval metadata could not be durably recorded; query not executed.",
+			})
+		}
 		s.emitAlert(ctx, "warning", "approval_requested", args.AgentID, analysis, querySHA, approvalID, args.SnapshotID, "Review exact query hash, environment, and recovery point before approving.", decision.Reason)
 
 		// RequestApproval blocks until approved, denied, or timed out.
@@ -581,15 +594,19 @@ func (s *MCPServer) checkRecoveryReadiness(ctx context.Context, manifest Snapsho
 			return fmt.Errorf("recovery readiness failed: snapshot age %s exceeds RPO %s", age.Round(time.Second), maxAge)
 		}
 	}
-	if s.policy.RequireSidecarHeartbeat {
-		if s.registry == nil || s.registry.metadata == nil {
-			return fmt.Errorf("recovery readiness failed: metadata DB is required for sidecar heartbeat")
+	if s.registry == nil || s.registry.metadata == nil {
+		if s.policy.RequireSidecarHeartbeat {
+			return fmt.Errorf("recovery readiness failed: metadata DB is required for sidecar heartbeat and snapshot metadata validation")
 		}
+	} else if err := s.registry.metadata.ValidateSnapshotRecord(ctx, manifest); err != nil {
+		return fmt.Errorf("recovery readiness failed: %w", err)
+	}
+	if s.policy.RequireSidecarHeartbeat {
 		status, checkedAt, ok := s.registry.metadata.GetHealth(ctx, "sync")
 		if !ok {
 			return fmt.Errorf("recovery readiness failed: sync sidecar heartbeat is missing")
 		}
-		if status != "healthy" && status != "starting" {
+		if status != "healthy" {
 			return fmt.Errorf("recovery readiness failed: sync sidecar status is %s", status)
 		}
 		maxAge := time.Duration(s.policy.MaxSidecarHeartbeatSeconds) * time.Second
@@ -643,7 +660,7 @@ func (s *MCPServer) recoveryGroupForTable(table string) (string, []string) {
 	return "", nil
 }
 
-// toolRestoreSnapshot implements the restore_snapshot MCP tool.
+// toolRestoreSnapshot implements the prepare_restore_snapshot MCP tool.
 func (s *MCPServer) toolRestoreSnapshot(ctx context.Context, id any, rawArgs json.RawMessage) MCPResponse {
 	var args restoreSnapshotParams
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
@@ -658,9 +675,6 @@ func (s *MCPServer) toolRestoreSnapshot(ctx context.Context, id any, rawArgs jso
 	if args.AgentID == "" {
 		return errorResponse(id, rpcInvalidParams, "agent_id is required")
 	}
-	if s.defaultDBURL == "" {
-		return errorResponse(id, rpcInvalidParams, "gateway --db is required to build the Python restore command")
-	}
 	if s.storage == "" {
 		return errorResponse(id, rpcInvalidParams, "gateway --storage is required to build the Python restore command")
 	}
@@ -669,21 +683,18 @@ func (s *MCPServer) toolRestoreSnapshot(ctx context.Context, id any, rawArgs jso
 	// Record in audit log as a HIGH-risk action (restore modifies data).
 	s.registry.RecordDetailed(args.AgentID, fmt.Sprintf("RESTORE %s FROM %s", args.Table, args.SnapshotID), RiskHigh, true, "", s.environment, s.clusterID)
 
-	targetTable := args.Table + "_recovered"
-	command := fmt.Sprintf(
-		"backstop restore --db %s --storage %s --snapshot-id %s --table %s",
-		s.defaultDBURL,
-		s.storage,
-		args.SnapshotID,
-		args.Table,
-	)
+	targetTable := strings.TrimSpace(args.TargetTable)
+	if targetTable == "" {
+		targetTable = args.Table + "_recovered"
+	}
+	command := fmt.Sprintf("backstop restore --db \"$BACKSTOP_RESTORE_DB\" --storage %s --snapshot-id %s --table %s --target-table %s", shellQuote(s.storage), shellQuote(args.SnapshotID), shellQuote(args.Table), shellQuote(targetTable))
 	return okResponse(id, map[string]any{
-		"status":          "restore_command",
+		"status":          "restore_plan",
 		"snapshot_id":     args.SnapshotID,
 		"source_table":    args.Table,
 		"target_table":    targetTable,
 		"restore_command": command,
-		"message":         "Gateway v1 does not restore directly. Run the returned Python CLI command.",
+		"message":         "Run this Backstop CLI command in an operator shell with BACKSTOP_RESTORE_DB set. The gateway intentionally does not return database credentials.",
 		"recorded_at":     time.Now().UTC().Format(time.RFC3339),
 		"environment":     s.environment,
 		"cluster_id":      s.clusterID,
@@ -697,7 +708,7 @@ func (s *MCPServer) executeSQL(ctx context.Context, args executeQueryParams, ana
 		if strings.TrimSpace(args.DBURL) == "" {
 			return nil, errors.New("gateway has no --db configured and db_url argument is empty")
 		}
-		opened, err := sql.Open("postgres", args.DBURL)
+		opened, err := sql.Open("postgres", ensurePostgresApplicationName(args.DBURL, "backstop-gateway"))
 		if err != nil {
 			return nil, err
 		}
@@ -759,6 +770,13 @@ func (s *MCPServer) executeSQL(ctx context.Context, args executeQueryParams, ana
 		"result_type":   "command",
 		"rows_affected": rowsAffected,
 	}, nil
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return `""`
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
 func returnsRows(analysis sqlAnalysis) bool {
@@ -866,4 +884,3 @@ func errorResponse(id any, code int, message string) MCPResponse {
 		Error:   &RPCError{Code: code, Message: message},
 	}
 }
-

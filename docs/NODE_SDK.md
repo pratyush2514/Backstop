@@ -95,6 +95,7 @@ BackstopRecoveryNotReadyError
 
 ```ts
 await backstop.listSnapshots({ table: "users" });
+await backstop.prepareRestoreSnapshot("snap_1234", "users");
 await backstop.getPendingApprovals();
 await backstop.approve("appr_1234");
 await backstop.deny("appr_1234");
@@ -106,4 +107,6 @@ await backstop.getMetrics();
 
 Approval methods should be used by operator/admin flows, not by autonomous
 agents unless you explicitly trust that agent to approve its own writes.
+`prepareRestoreSnapshot` returns a secret-safe restore plan and never includes
+the raw database connection string in the SDK/MCP response.
 

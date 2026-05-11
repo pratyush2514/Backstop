@@ -21,6 +21,8 @@ import type {
   JsonRpcResponse,
   ListSnapshotsOptions,
   RequestOptions,
+  RestoreSnapshotOptions,
+  RestoreSnapshotPlan,
 } from "./types.js";
 import { ensureLocalRuntime } from "./runtime.js";
 
@@ -114,6 +116,21 @@ export class BackstopClient {
     const params = new URLSearchParams();
     if (options.table) params.set("table", options.table);
     return this.getJson<CollectionResponse>(`/metadata/snapshots${queryString(params)}`, options);
+  }
+
+  prepareRestoreSnapshot(snapshotId: string, table: string, options: RestoreSnapshotOptions = {}): Promise<RestoreSnapshotPlan> {
+    if (!snapshotId || !snapshotId.trim()) throw new BackstopError("snapshot id is required");
+    if (!table || !table.trim()) throw new BackstopError("table is required");
+    return this.rpcCall<RestoreSnapshotPlan>(
+      "prepare_restore_snapshot",
+      {
+        snapshot_id: snapshotId,
+        table,
+        agent_id: options.agentId || this.agentId,
+        target_table: options.targetTable,
+      },
+      options,
+    );
   }
 
   async getAudit(options: AuditOptions = {}): Promise<CollectionResponse> {

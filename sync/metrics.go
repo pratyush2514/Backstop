@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,6 +17,7 @@ type SyncMetrics struct {
 	latest       map[string]time.Time
 	bypass       map[string]int64
 	posture      string
+	health       HealthSnapshot
 }
 
 func NewSyncMetrics() *SyncMetrics {
@@ -24,6 +26,43 @@ func NewSyncMetrics() *SyncMetrics {
 		latest:    make(map[string]time.Time),
 		bypass:    make(map[string]int64),
 		posture:   PreventionHealthy,
+		health: HealthSnapshot{
+			Status:  "starting",
+			Checked: time.Now().UTC(),
+			Detail:  map[string]any{"reason": "process_starting"},
+		},
+	}
+}
+
+type HealthSnapshot struct {
+	Status  string         `json:"status"`
+	Checked time.Time      `json:"checked_at"`
+	Detail  map[string]any `json:"detail,omitempty"`
+}
+
+func (m *SyncMetrics) SetHealth(status string, detail map[string]any) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.health = HealthSnapshot{
+		Status:  status,
+		Checked: time.Now().UTC(),
+		Detail:  cloneDetail(detail),
+	}
+}
+
+func (m *SyncMetrics) Health() HealthSnapshot {
+	if m == nil {
+		return HealthSnapshot{Status: "unhealthy", Checked: time.Now().UTC(), Detail: map[string]any{"reason": "metrics_unavailable"}}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return HealthSnapshot{
+		Status:  m.health.Status,
+		Checked: m.health.Checked,
+		Detail:  cloneDetail(m.health.Detail),
 	}
 }
 
@@ -122,7 +161,39 @@ func (m *SyncMetrics) Prometheus(now time.Time) string {
 		}
 		fmt.Fprintf(&b, "backstop_prevention_posture{status=%q} %d\n", posture, value)
 	}
+	b.WriteString("# TYPE backstop_sync_health gauge\n")
+	for _, status := range []string{"starting", "healthy", "degraded", "paused", "unhealthy"} {
+		value := 0
+		if m.health.Status == status {
+			value = 1
+		}
+		fmt.Fprintf(&b, "backstop_sync_health{status=%q} %d\n", status, value)
+	}
 	return b.String()
+}
+
+func cloneDetail(detail map[string]any) map[string]any {
+	if detail == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(detail))
+	for key, value := range detail {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func healthJSON(snapshot HealthSnapshot) []byte {
+	raw, err := json.Marshal(map[string]any{
+		"service":    "backstop-sync",
+		"status":     snapshot.Status,
+		"checked_at": snapshot.Checked.Format(time.RFC3339Nano),
+		"detail":     snapshot.Detail,
+	})
+	if err != nil {
+		return []byte(`{"service":"backstop-sync","status":"unhealthy","detail":{"reason":"health_json_encode_failed"}}`)
+	}
+	return raw
 }
 
 func sortedCounterKeys(values map[string]int64) []string {
@@ -142,4 +213,3 @@ func sortedTimeKeys(values map[string]time.Time) []string {
 	sort.Strings(keys)
 	return keys
 }
-

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -41,9 +42,8 @@ func (s *MCPServer) analyzeImpact(ctx context.Context, args executeQueryParams, 
 		return impact
 	}
 
-	whereClause := extractWhereClause(args.Query)
-	if whereClause == "" {
-		return s.unknownImpact("write predicate could not be extracted")
+	if analysis.StatementCount != 1 {
+		return s.unknownImpact("impact analysis requires exactly one SQL statement")
 	}
 
 	db, closeDB, err := s.openQueryDB(args)
@@ -56,11 +56,12 @@ func (s *MCPServer) analyzeImpact(ctx context.Context, args executeQueryParams, 
 
 	impactCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	qualified := quoteQualified(analysis.Schema, table)
-	countQuery := fmt.Sprintf("SELECT count(*) FROM %s WHERE %s", qualified, whereClause)
-	if err := db.QueryRowContext(impactCtx, countQuery).Scan(&impact.EstimatedAffectedRows); err != nil {
-		return s.unknownImpact("affected row count failed: " + err.Error())
+	estimated, err := estimateAffectedRowsWithExplain(impactCtx, db, args.Query)
+	if err != nil {
+		return s.unknownImpact("affected row estimate failed: " + err.Error())
 	}
+	impact.EstimatedAffectedRows = estimated
+	qualified := quoteQualified(analysis.Schema, table)
 	totalQuery := fmt.Sprintf("SELECT count(*) FROM %s", qualified)
 	if err := db.QueryRowContext(impactCtx, totalQuery).Scan(&impact.EstimatedTableRows); err != nil {
 		return s.unknownImpact("table row count failed: " + err.Error())
@@ -75,6 +76,58 @@ func (s *MCPServer) analyzeImpact(ctx context.Context, args executeQueryParams, 
 		impact.Reason = "write impact exceeds configured thresholds"
 	}
 	return impact
+}
+
+func estimateAffectedRowsWithExplain(ctx context.Context, db *sql.DB, query string) (int64, error) {
+	rows, err := db.QueryContext(ctx, "EXPLAIN (FORMAT JSON) "+strings.TrimSpace(query))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, fmt.Errorf("EXPLAIN returned no rows")
+	}
+	var raw string
+	if err := rows.Scan(&raw); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return 0, err
+	}
+	if estimate, ok := firstPlanRows(payload); ok {
+		return estimate, nil
+	}
+	return 0, fmt.Errorf("EXPLAIN plan did not include row estimate")
+}
+
+func firstPlanRows(value any) (int64, bool) {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			if rows, ok := firstPlanRows(item); ok {
+				return rows, true
+			}
+		}
+	case map[string]any:
+		if raw, ok := v["Plan Rows"].(float64); ok {
+			return int64(raw), true
+		}
+		if plan, ok := v["Plan"]; ok {
+			if rows, ok := firstPlanRows(plan); ok {
+				return rows, true
+			}
+		}
+		if plans, ok := v["Plans"]; ok {
+			if rows, ok := firstPlanRows(plans); ok {
+				return rows, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (s *MCPServer) unknownImpact(reason string) *ImpactAnalysis {
@@ -92,32 +145,18 @@ func (s *MCPServer) openQueryDB(args executeQueryParams) (*sql.DB, func() error,
 	if strings.TrimSpace(args.DBURL) == "" {
 		return nil, nil, fmt.Errorf("impact analysis requires gateway --db or db_url")
 	}
-	db, err := sql.Open("postgres", args.DBURL)
+	db, err := sql.Open("postgres", ensurePostgresApplicationName(args.DBURL, "backstop-gateway"))
 	if err != nil {
 		return nil, nil, err
 	}
 	return db, db.Close, nil
 }
 
-func extractWhereClause(query string) string {
-	re := regexp.MustCompile(`(?is)\bwhere\b(.+)$`)
-	match := re.FindStringSubmatch(query)
-	if len(match) != 2 {
-		return ""
-	}
-	clause := strings.TrimSpace(match[1])
-	clause = strings.TrimSuffix(clause, ";")
-	if strings.Contains(clause, ";") {
-		return ""
-	}
-	return clause
-}
-
 func protectedUpdatedColumns(query string, protected []string) []string {
 	if len(protected) == 0 {
 		return nil
 	}
-	re := regexp.MustCompile(`(?is)\bset\b(.+?)\bwhere\b`)
+	re := regexp.MustCompile(`(?is)\bset\b(.+?)(?:\bwhere\b|$)`)
 	match := re.FindStringSubmatch(query)
 	if len(match) != 2 {
 		return nil

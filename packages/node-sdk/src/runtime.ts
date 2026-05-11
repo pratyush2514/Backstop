@@ -397,7 +397,7 @@ async function writeTokenFile(file: string, tokens: Record<string, string>): Pro
       {
         name: "operator-local",
         token: tokens.operator,
-        scopes: ["approval:read", "approval:write", "metadata:read"],
+        scopes: ["approval:read", "approval:write", "metadata:read", "restore:prepare"],
       },
       {
         name: "readonly-local",
@@ -407,7 +407,7 @@ async function writeTokenFile(file: string, tokens: Record<string, string>): Pro
       {
         name: "admin-local",
         token: tokens.admin,
-        scopes: ["admin:*", "query:analyze", "query:execute", "approval:read", "approval:write", "metadata:read", "metrics:read"],
+        scopes: ["admin:*", "query:analyze", "query:execute", "approval:read", "approval:write", "metadata:read", "metrics:read", "restore:prepare"],
       },
     ],
   };

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +17,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "--healthcheck" {
+		if err := runHTTPHealthcheck(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	// -------------------------------------------------------------------------
 	// CLI flags
 	// -------------------------------------------------------------------------
@@ -26,6 +35,11 @@ func main() {
 	endpointURL := flag.String("endpoint-url", "", "Custom S3 endpoint URL for MinIO or compatible stores")
 	schema := flag.String("schema", "public", "PostgreSQL schema to snapshot and monitor")
 	snapshotOnStart := flag.Bool("snapshot-on-start", true, "Snapshot every discovered table once on startup")
+	snapshotEveryPoll := flag.Bool("snapshot-every-poll", false, "Snapshot every table on every poll instead of only new, changed, or retry-needed tables")
+	snapshotTables := flag.String("snapshot-tables", "", "Optional comma-separated allowlist of tables to snapshot and monitor in the selected schema")
+	snapshotStartupGrace := flag.Duration("snapshot-startup-grace", 15*time.Second, "Delay before first snapshot poll so database initialization can settle")
+	snapshotStablePolls := flag.Int("snapshot-stable-polls", 2, "Consecutive unchanged table fingerprints required before snapshotting a new or changed table")
+	snapshotPauseFile := flag.String("snapshot-pause-file", os.Getenv("BACKSTOP_SNAPSHOT_PAUSE_FILE"), "If this file exists, sync records health but skips snapshot capture")
 	maxTableRows := flag.Int("max-table-rows", 1000000, "Maximum rows to snapshot per table before failing that table snapshot")
 	metadataDB := flag.String("metadata-db", os.Getenv("BACKSTOP_METADATA_DB"), "Optional SQLite metadata database path")
 	metricsListen := flag.String("metrics-listen", "", "Optional HTTP listen address for Prometheus metrics, e.g. :9091")
@@ -55,6 +69,11 @@ func main() {
 		"interval_sec", *intervalSec,
 		"schema", *schema,
 		"snapshot_on_start", *snapshotOnStart,
+		"snapshot_every_poll", *snapshotEveryPoll,
+		"snapshot_tables", *snapshotTables,
+		"snapshot_startup_grace", snapshotStartupGrace.String(),
+		"snapshot_stable_polls", *snapshotStablePolls,
+		"snapshot_pause_file", *snapshotPauseFile,
 		"max_table_rows", *maxTableRows,
 		"metadata_db", *metadataDB != "",
 		"metrics_listen", *metricsListen,
@@ -126,7 +145,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer metadata.Close()
-	metadata.RecordHealth(context.Background(), "sync", "starting", map[string]any{"schema": *schema})
+	if err := metadata.RecordHealth(context.Background(), "sync", "starting", map[string]any{"schema": *schema}); err != nil {
+		slog.Error("Failed to record sync startup metadata", "error", err)
+		os.Exit(1)
+	}
 
 	tracker := NewDeltaTracker()
 	metrics := NewSyncMetrics()
@@ -141,6 +163,9 @@ func main() {
 		snapshotEngine,
 		*snapshotOnStart,
 	)
+	poller.ConfigureSnapshotStrategy(*snapshotEveryPoll)
+	poller.ConfigureTableAllowlist(parseCSV(*snapshotTables))
+	poller.ConfigureStability(*snapshotStartupGrace, *snapshotStablePolls, *snapshotPauseFile)
 	poller.ConfigureLaunchReadiness(metrics, metadata, *maxSnapshotAge, *maxSnapshotFailures)
 	if *bypassDetection {
 		poller.ConfigureBypassDetector(NewBypassDetector(db, BypassConfig{
@@ -167,12 +192,24 @@ func main() {
 	// -------------------------------------------------------------------------
 	poller.Run(ctx)
 
-	metadata.RecordHealth(context.Background(), "sync", "stopped", map[string]any{"schema": *schema})
+	if err := metadata.RecordHealth(context.Background(), "sync", "stopped", map[string]any{"schema": *schema}); err != nil {
+		slog.Error("Failed to record sync stopped metadata", "error", err)
+	}
 	slog.Info("backstop-sync shut down cleanly")
 }
 
 func startMetricsServer(ctx context.Context, listen string, metrics *SyncMetrics) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		health := metrics.Health()
+		w.Header().Set("Content-Type", "application/json")
+		if health.Status != "healthy" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		_, _ = w.Write(healthJSON(health))
+	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		w.WriteHeader(http.StatusOK)
@@ -193,6 +230,20 @@ func startMetricsServer(ctx context.Context, listen string, metrics *SyncMetrics
 	}()
 }
 
+func runHTTPHealthcheck(url string) error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("healthcheck failed: %s", resp.Status)
+	}
+	return nil
+}
+
 func waitForDB(ctx context.Context, db *sql.DB) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -211,4 +262,3 @@ func waitForDB(ctx context.Context, db *sql.DB) error {
 		}
 	}
 }
-

@@ -77,6 +77,10 @@ func (s *GatewayAlertSink) Emit(ctx context.Context, payload GatewayAlertPayload
 		s.metrics.IncAlert(payload.EventType, status)
 	}
 	if s.metadata != nil {
-		s.metadata.RecordAlert(ctx, payload.Severity, payload.EventType, payload.Table, status, payload)
+		if err := s.metadata.RecordAlert(ctx, payload.Severity, payload.EventType, payload.Table, status, payload); err != nil {
+			if s.metrics != nil {
+				s.metrics.IncAlert(payload.EventType, "metadata_failed")
+			}
+		}
 	}
 }

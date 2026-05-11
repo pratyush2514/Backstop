@@ -59,6 +59,35 @@ test("analyzeQuery calls analyze_query without execution options", async () => {
   assert.equal(result.risk_level, "CRITICAL");
 });
 
+test("prepareRestoreSnapshot returns a secret-safe restore plan", async () => {
+  let seen;
+  const client = new BackstopClient({
+    url: "http://localhost:8080",
+    agentId: "operator-1",
+    fetchImpl: async (_url, init) => {
+      seen = JSON.parse(init.body);
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: seen.id,
+        result: {
+          status: "restore_plan",
+          snapshot_id: "snap_1234",
+          source_table: "users",
+          target_table: "users_recovered",
+          restore_command: 'backstop restore --db "$BACKSTOP_RESTORE_DB" --storage s3://bucket --snapshot-id snap_1234 --table users',
+        },
+      });
+    },
+  });
+
+  const result = await client.prepareRestoreSnapshot("snap_1234", "users", { targetTable: "users_recovered" });
+  assert.equal(seen.params.name, "prepare_restore_snapshot");
+  assert.equal(seen.params.arguments.agent_id, "operator-1");
+  assert.equal(seen.params.arguments.target_table, "users_recovered");
+  assert.equal(result.status, "restore_plan");
+  assert(!result.restore_command.includes("postgres://"));
+});
+
 test("policy results can be promoted to typed errors", async () => {
   const client = new BackstopClient({
     url: "http://localhost:8080",

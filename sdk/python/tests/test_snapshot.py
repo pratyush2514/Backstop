@@ -10,6 +10,7 @@ Mark: pytest.mark.integration — skipped automatically if services are unavaila
 from __future__ import annotations
 
 import io
+from botocore.exceptions import ClientError
 
 import pyarrow.parquet as pq
 import pytest
@@ -50,7 +51,7 @@ class TestCaptureTable:
         )
 
         assert manifest.snapshot_id.startswith("snap_")
-        assert len(manifest.snapshot_id) == 13  # "snap_" + 8 hex chars
+        assert len(manifest.snapshot_id) == 37  # "snap_" + 32 hex chars
         assert manifest.row_count == 5
         assert manifest.table_name == "users"
         assert manifest.operation == "DROP TABLE"
@@ -129,6 +130,59 @@ class TestCaptureTable:
         )
 
         assert manifest.row_count == 0
+
+    def test_capture_cleans_up_data_when_manifest_write_fails(
+        self, pg_conn, s3_client, engine, users_table, monkeypatch
+    ) -> None:
+        """Manifest write interruption must not leave eligible orphaned data."""
+        original_put_object = engine._s3.put_object
+        deleted: list[str] = []
+
+        def fail_manifest_put(*args, **kwargs):
+            key = kwargs.get("Key")
+            if key and key.endswith("/manifest.json"):
+                raise RuntimeError("injected manifest write failure")
+            return original_put_object(*args, **kwargs)
+
+        original_delete = engine._s3.delete_object
+
+        def record_delete(*args, **kwargs):
+            deleted.append(kwargs["Key"])
+            return original_delete(*args, **kwargs)
+
+        monkeypatch.setattr(engine._s3, "put_object", fail_manifest_put)
+        monkeypatch.setattr(engine._s3, "delete_object", record_delete)
+
+        with pytest.raises(RuntimeError, match="injected manifest write failure"):
+            engine.capture_table(
+                conn=pg_conn,
+                table="users",
+                query="DROP TABLE users",
+                operation="DROP TABLE",
+            )
+
+        assert any(key.endswith("/data.parquet") for key in deleted)
+        for key in deleted:
+            with pytest.raises(ClientError):
+                s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+
+    def test_capture_fails_closed_when_uploaded_data_verification_fails(
+        self, pg_conn, engine, users_table, monkeypatch
+    ) -> None:
+        """Uploaded data corruption before manifest publication must abort capture."""
+        monkeypatch.setattr(
+            engine,
+            "_verify_uploaded_data",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected checksum mismatch")),
+        )
+
+        with pytest.raises(RuntimeError, match="injected checksum mismatch"):
+            engine.capture_table(
+                conn=pg_conn,
+                table="users",
+                query="DROP TABLE users",
+                operation="DROP TABLE",
+            )
 
     def test_capture_records_secondary_indexes(self, pg_conn, engine, users_table) -> None:
         """Snapshot metadata should preserve non-primary index DDL."""

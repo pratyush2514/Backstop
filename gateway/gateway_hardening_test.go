@@ -288,6 +288,17 @@ func TestAuditScrubsSecrets(t *testing.T) {
 	}
 }
 
+func TestInMemoryAuditIsBounded(t *testing.T) {
+	registry := NewAgentRegistry()
+	for i := 0; i < maxInMemoryAuditEntries+5; i++ {
+		registry.Record("agent-1", "SELECT 1", RiskSafe, true)
+	}
+	entries := registry.AllEntries()
+	if len(entries) != maxInMemoryAuditEntries {
+		t.Fatalf("entries = %d, want %d", len(entries), maxInMemoryAuditEntries)
+	}
+}
+
 func TestProtectedColumnPromotesImpactCritical(t *testing.T) {
 	server := NewMCPServer(NewApprovalEngine(0), NewAgentRegistry(), "", nil, "", "", false, nil)
 	server.policy.ProtectedColumns = map[string][]string{"users": []string{"email"}}
@@ -299,6 +310,41 @@ func TestProtectedColumnPromotesImpactCritical(t *testing.T) {
 	}
 	if len(impact.ProtectedColumns) != 1 || impact.ProtectedColumns[0] != "email" {
 		t.Fatalf("protected columns = %+v", impact.ProtectedColumns)
+	}
+}
+
+func TestProtectedColumnDetectedWithoutWhereClause(t *testing.T) {
+	server := NewMCPServer(NewApprovalEngine(0), NewAgentRegistry(), "", nil, "", "", false, nil)
+	server.policy.ProtectedColumns = map[string][]string{"users": []string{"email"}}
+
+	analysis := analyzeSQL("UPDATE users SET email = NULL")
+	impact := server.analyzeImpact(context.Background(), executeQueryParams{Query: "UPDATE users SET email = NULL"}, analysis)
+	if impact == nil || !impact.ImpactCritical {
+		t.Fatalf("impact = %+v, want critical", impact)
+	}
+	if len(impact.ProtectedColumns) != 1 || impact.ProtectedColumns[0] != "email" {
+		t.Fatalf("protected columns = %+v", impact.ProtectedColumns)
+	}
+}
+
+func TestGenerateIDUsesHighEntropyLength(t *testing.T) {
+	id := generateID("appr")
+	if !strings.HasPrefix(id, "appr_") {
+		t.Fatalf("id = %q, want appr_ prefix", id)
+	}
+	if got := len(strings.TrimPrefix(id, "appr_")); got != 32 {
+		t.Fatalf("random suffix length = %d, want 32", got)
+	}
+}
+
+func TestEnsurePostgresApplicationName(t *testing.T) {
+	got := ensurePostgresApplicationName("postgresql://user:pass@localhost/db?sslmode=disable", "backstop-gateway")
+	if !strings.Contains(got, "application_name=backstop-gateway") {
+		t.Fatalf("application_name not added: %s", got)
+	}
+	kept := ensurePostgresApplicationName("postgresql://user:pass@localhost/db?application_name=custom", "backstop-gateway")
+	if !strings.Contains(kept, "application_name=custom") {
+		t.Fatalf("existing application_name not preserved: %s", kept)
 	}
 }
 
@@ -337,3 +383,149 @@ func TestRecoveryReadinessBlocksStaleSnapshot(t *testing.T) {
 	}
 }
 
+func TestRecoveryReadinessRequiresHealthySidecarHeartbeat(t *testing.T) {
+	store, err := OpenMetadataStore(t.TempDir() + "/backstop.db")
+	if err != nil {
+		t.Fatalf("open metadata: %v", err)
+	}
+	defer store.Close()
+	store.RecordHealth(context.Background(), "sync", "starting", map[string]any{"phase": "catalog_scanned"})
+
+	server := NewMCPServer(NewApprovalEngine(0), NewAgentRegistryWithStores("", store), "", nil, "", "", false, nil)
+	server.policy.RequireSidecarHeartbeat = true
+	server.policy.MaxSidecarHeartbeatSeconds = 60
+	manifest := SnapshotManifest{
+		SnapshotID:    "snap_new",
+		TableName:     "audit_logs",
+		Writer:        sidecarWriter,
+		S3DataKey:     "backstop/snapshots/audit_logs/snap_new/data.parquet",
+		S3ManifestKey: "backstop/snapshots/audit_logs/snap_new/manifest.json",
+		DataSHA256:    strings.Repeat("a", 64),
+		Status:        "valid",
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := store.RecordSnapshot(context.Background(), manifest); err != nil {
+		t.Fatalf("record snapshot: %v", err)
+	}
+	err = server.checkRecoveryReadiness(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), "sync sidecar status is starting") {
+		t.Fatalf("expected starting sidecar heartbeat to fail readiness, got %v", err)
+	}
+}
+
+func TestRecoveryReadinessRequiresMatchingSnapshotMetadata(t *testing.T) {
+	store, err := OpenMetadataStore(t.TempDir() + "/backstop.db")
+	if err != nil {
+		t.Fatalf("open metadata: %v", err)
+	}
+	defer store.Close()
+	server := NewMCPServer(NewApprovalEngine(0), NewAgentRegistryWithStores("", store), "", nil, "", "", false, nil)
+	server.policy.RequireSidecarHeartbeat = false
+	manifest := SnapshotManifest{
+		SnapshotID:    "snap_ready",
+		Writer:        sidecarWriter,
+		TableName:     "audit_logs",
+		SnapshotScope: "table",
+		S3ManifestKey: "backstop/snapshots/audit_logs/snap_ready/manifest.json",
+		S3DataKey:     "backstop/snapshots/audit_logs/snap_ready/data.parquet",
+		DataSHA256:    strings.Repeat("a", 64),
+		Status:        "valid",
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := server.checkRecoveryReadiness(context.Background(), manifest); err == nil || !strings.Contains(err.Error(), "missing from SQLite metadata") {
+		t.Fatalf("expected missing metadata to fail readiness, got %v", err)
+	}
+	if err := store.RecordSnapshot(context.Background(), manifest); err != nil {
+		t.Fatalf("record snapshot: %v", err)
+	}
+	if err := server.checkRecoveryReadiness(context.Background(), manifest); err != nil {
+		t.Fatalf("matching metadata should satisfy readiness: %v", err)
+	}
+}
+
+func TestQuarantinedSnapshotExcludedFromLatestValidMetadata(t *testing.T) {
+	store, err := OpenMetadataStore(t.TempDir() + "/backstop.db")
+	if err != nil {
+		t.Fatalf("open metadata: %v", err)
+	}
+	defer store.Close()
+	if err := store.QuarantineManifest(context.Background(), "snap_bad", "audit_logs", "backstop/snapshots/audit_logs/snap_bad/manifest.json", "decode failed"); err != nil {
+		t.Fatalf("quarantine manifest: %v", err)
+	}
+	rows, err := store.QuerySnapshots(context.Background(), "audit_logs", true)
+	if err != nil {
+		t.Fatalf("query snapshots: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("quarantined snapshot must not be latest valid: %+v", rows)
+	}
+	all, err := store.QuerySnapshots(context.Background(), "audit_logs", false)
+	if err != nil {
+		t.Fatalf("query all snapshots: %v", err)
+	}
+	if len(all) != 1 || all[0]["status"] != "quarantined" {
+		t.Fatalf("quarantine state not auditable: %+v", all)
+	}
+}
+
+func TestGatewayRestartDoesNotApproveOrphanedPendingApproval(t *testing.T) {
+	store, err := OpenMetadataStore(t.TempDir() + "/backstop.db")
+	if err != nil {
+		t.Fatalf("open metadata: %v", err)
+	}
+	defer store.Close()
+	details := ApprovalDetails{
+		ID:          "appr_orphaned",
+		Query:       "DROP TABLE users",
+		QuerySHA256: querySHA256("DROP TABLE users"),
+		AgentID:     "agent-1",
+		RiskLevel:   RiskCritical,
+		Operation:   "DROP TABLE",
+		Table:       "users",
+		Environment: "prod",
+		ClusterID:   "cluster-a",
+		SnapshotID:  "snap_ready",
+	}
+	if err := NewAgentRegistryWithStores("", store).RecordApprovalRequested(context.Background(), details); err != nil {
+		t.Fatalf("record pending approval: %v", err)
+	}
+
+	restartedApprovalEngine := NewApprovalEngine(time.Second)
+	if err := restartedApprovalEngine.Approve(details.ID, "operator"); err != ErrApprovalNotFound {
+		t.Fatalf("orphaned approval after restart err = %v, want ErrApprovalNotFound", err)
+	}
+	rows, err := store.QueryRows(context.Background(), "approvals", map[string]string{"approval_id": details.ID})
+	if err != nil {
+		t.Fatalf("query approval metadata: %v", err)
+	}
+	if len(rows) != 1 || rows[0]["status"] != "pending" {
+		t.Fatalf("orphaned approval metadata should remain auditable pending state: %+v", rows)
+	}
+}
+
+func TestSidecarManifestValidationRejectsInvalidRecoveryPoints(t *testing.T) {
+	valid := SnapshotManifest{
+		SnapshotID:    "snap_123",
+		Writer:        sidecarWriter,
+		TableName:     "audit_logs",
+		SnapshotScope: "table",
+		DataSHA256:    strings.Repeat("a", 64),
+		Status:        "valid",
+	}
+	if err := validateSidecarManifest(valid, "audit_logs"); err != nil {
+		t.Fatalf("valid sidecar manifest rejected: %v", err)
+	}
+
+	invalid := valid
+	invalid.Status = "incomplete"
+	invalid.ValidationError = "upload interrupted"
+	if err := validateSidecarManifest(invalid, "audit_logs"); err == nil || !strings.Contains(err.Error(), "not valid") {
+		t.Fatalf("expected invalid status rejection, got %v", err)
+	}
+
+	missingHash := valid
+	missingHash.DataSHA256 = ""
+	if err := validateSidecarManifest(missingHash, "audit_logs"); err == nil || !strings.Contains(err.Error(), "data_sha256") {
+		t.Fatalf("expected missing hash rejection, got %v", err)
+	}
+}

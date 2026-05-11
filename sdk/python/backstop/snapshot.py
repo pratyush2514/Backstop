@@ -43,7 +43,7 @@ class SnapshotManifest(BaseModel):
     """Metadata record for a single table snapshot.
 
     Attributes:
-        snapshot_id: Unique identifier in the format ``snap_{8-char hex}``.
+        snapshot_id: Unique identifier in the format ``snap_{32-char hex}``.
         timestamp: ISO 8601 UTC timestamp of when the snapshot was taken.
         table_name: The source table that was snapshotted.
         query: The dangerous query that triggered this snapshot.
@@ -77,6 +77,8 @@ class SnapshotManifest(BaseModel):
     s3_manifest_key: str
     data_sha256: Optional[str] = None
     snapshot_scope: str = "table"
+    status: str = "valid"
+    validation_error: Optional[str] = None
     source_select_sql: Optional[str] = None
 
 
@@ -236,11 +238,12 @@ class SnapshotEngine:
             source_select_sql=select_sql,
         )
 
-    def list_snapshots(self, table: Optional[str] = None) -> list[SnapshotManifest]:
-        """List all snapshots stored in S3, optionally filtered by table.
+    def list_snapshots(self, table: Optional[str] = None, writer: Optional[str] = None) -> list[SnapshotManifest]:
+        """List all snapshots stored in S3, optionally filtered by table and writer.
 
         Args:
             table: If provided, only return snapshots for this table.
+            writer: If provided, only return snapshots from this manifest writer.
 
         Returns:
             List of :class:`SnapshotManifest` objects sorted by timestamp
@@ -263,7 +266,10 @@ class SnapshotEngine:
                 try:
                     response = self._s3.get_object(Bucket=self._bucket, Key=key)
                     raw = response["Body"].read()
-                    manifests.append(SnapshotManifest.model_validate_json(raw))
+                    manifest = SnapshotManifest.model_validate_json(raw)
+                    if writer is not None and manifest.writer != writer:
+                        continue
+                    manifests.append(manifest)
                 except Exception as exc:
                     logger.warning("[backstop] Failed to read manifest at %s: %s", key, exc)
 
@@ -274,7 +280,7 @@ class SnapshotEngine:
         """Fetch a specific snapshot manifest by ID and table name.
 
         Args:
-            snapshot_id: The snapshot identifier (e.g. ``snap_a3f91c2b``).
+            snapshot_id: The snapshot identifier (e.g. ``snap_a3f91c2b4d6e7890a1234567890bcdef``).
             table: The table name the snapshot belongs to.
 
         Returns:
@@ -549,7 +555,7 @@ class SnapshotEngine:
         source_select_sql: Optional[str],
     ) -> SnapshotManifest:
         """Shared capture implementation for full-table and scoped snapshots."""
-        snapshot_id = f"snap_{uuid4().hex[:8]}"
+        snapshot_id = f"snap_{uuid4().hex}"
         timestamp = datetime.now(timezone.utc).isoformat()
 
         schema_ddl = self._get_table_ddl(conn, table)
@@ -583,6 +589,13 @@ class SnapshotEngine:
                 ExtraArgs={"ContentType": "application/octet-stream"},
                 Config=self._transfer_config,
             )
+            self._verify_uploaded_data(data_key, data_sha256)
+        except Exception:
+            try:
+                self._s3.delete_object(Bucket=self._bucket, Key=data_key)
+            except Exception:
+                logger.exception("[backstop] Failed to clean up incomplete snapshot data object %s", data_key)
+            raise
         finally:
             parquet_file.close()
 
@@ -609,18 +622,36 @@ class SnapshotEngine:
             snapshot_scope=snapshot_scope,
             source_select_sql=source_select_sql,
         )
-        self._s3.put_object(
-            Bucket=self._bucket,
-            Key=manifest_key,
-            Body=manifest.model_dump_json(indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=manifest_key,
+                Body=manifest.model_dump_json(indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            try:
+                self._s3.delete_object(Bucket=self._bucket, Key=data_key)
+            except Exception:
+                logger.exception("[backstop] Failed to clean up orphaned snapshot data object %s", data_key)
+            raise
 
         logger.info(
             "[backstop] Snapshot complete: id=%s table=%r rows=%d operation=%s scope=%s",
             snapshot_id, table, row_count, operation, snapshot_scope,
         )
         return manifest
+
+    def _verify_uploaded_data(self, data_key: str, expected_sha256: str) -> None:
+        """Read the uploaded data object back before publishing a valid manifest."""
+        response = self._s3.get_object(Bucket=self._bucket, Key=data_key)
+        body = response["Body"].read()
+        actual = hashlib.sha256(body).hexdigest()
+        if actual.lower() != expected_sha256.lower():
+            raise RuntimeError(
+                f"snapshot upload verification failed for {data_key}: "
+                f"sha256 mismatch got {actual} expected {expected_sha256}"
+            )
 
 
 def _quote_ident(identifier: str) -> str:

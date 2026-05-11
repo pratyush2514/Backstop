@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"time"
 )
 
@@ -46,6 +47,10 @@ func (s *MCPServer) recordRiskAttempt(ctx context.Context, agentID string, analy
 			s.emitAlert(ctx, "critical", "agent_quarantined", agentID, analysis, "", "", "", "Inspect agent behavior and deny similar destructive retries.", "Agent quarantined after repeated risky attempts.")
 		}
 	}
-	s.registry.metadata.SaveAgentState(ctx, state)
+	if err := s.registry.metadata.SaveAgentState(ctx, state); err != nil {
+		log.Printf("backstop-gateway: failed to persist agent state: %v", err)
+		s.metrics.IncBlock("metadata_write_failed")
+		return
+	}
 	s.metrics.IncRiskyAttempt(analysis.RiskLevel)
 }

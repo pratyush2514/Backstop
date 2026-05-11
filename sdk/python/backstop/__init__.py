@@ -9,7 +9,7 @@ protect_engine(engine, storage, actor, mode)
     Attach backstop protection to a SQLAlchemy Engine.
 
 RiskLevel
-    Enum of risk classifications: SAFE, LOW, HIGH, CRITICAL.
+    Enum of Python SDK risk classifications: SAFE, LOW, HIGH, CRITICAL.
 
 RiskResult
     Dataclass describing the result of a SQL risk assessment.

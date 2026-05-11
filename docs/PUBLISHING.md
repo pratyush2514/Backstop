@@ -59,8 +59,8 @@ ghcr.io/pratyush2514/backstop-cli:<tag>
 ## Release Flow
 
 1. Update versions:
-   Node packages in [packages/node-sdk/package.json](/C:/Users/Pratyush/Downloads/dbguard/packages/node-sdk/package.json) and [packages/mcp-server/package.json](/C:/Users/Pratyush/Downloads/dbguard/packages/mcp-server/package.json)
-   Python package in [sdk/python/pyproject.toml](/C:/Users/Pratyush/Downloads/dbguard/sdk/python/pyproject.toml)
+   Node packages in `packages/node-sdk/package.json` and `packages/mcp-server/package.json`.
+   Python package in `sdk/python/pyproject.toml`.
 
 2. Run local checks:
 

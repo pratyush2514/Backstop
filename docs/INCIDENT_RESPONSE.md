@@ -106,8 +106,10 @@ Actions:
 ## Snapshot Restore Fails Validation
 
 Actions:
+- use `backstop recover --db <url> --storage <s3-url> --table <table>` for the
+  guided path;
 - restore into `<table>_recovered`, not directly over the original table;
-- run `backstop restore-validate`;
+- if scripting, run `backstop restore-validate`;
 - compare row counts and schema artifacts;
 - inspect FK warnings and application-level consistency;
 - generate a copy-back plan and review locks/conflicts before applying.

@@ -5,6 +5,7 @@ packages/*/dist/
 package-lock.json.tmp
 .npm-cache/
 .tmp-build/
+*.exe
 
 .gocache/
 .e2e/
@@ -27,8 +28,7 @@ backstop.db
 sync/backstop-sync
 gateway/backstop-gateway
 
-
-# fumadocs-mdx generated source
-frontend/.source/
-frontend/tsconfig.tsbuildinfo
-frontend/screencapture-*.png
+Claude-Database recovery tool for accidental deletions.pdf
+pdf_text.txt
+frontend/
+how-it-works-check.png

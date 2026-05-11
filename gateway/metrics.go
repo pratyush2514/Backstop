@@ -175,4 +175,3 @@ func sortedMetricKeys(values map[string]int64) []string {
 	sort.Strings(keys)
 	return keys
 }
-

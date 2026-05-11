@@ -6,7 +6,7 @@
 
 **Open-source safety gateway and recovery layer for AI agents that touch PostgreSQL.**
 
-Stop the next `DROP TABLE`. Approve before it runs. Restore in seconds if it gets through.
+Stop the next `DROP TABLE`. Approve before it runs. Restore supported tables from a verified recovery point if it gets through.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-red.svg)](./LICENSE)
 [![npm: @backstop/client](https://img.shields.io/npm/v/@backstop/client?label=%40backstop%2Fclient&color=cc0000)](https://www.npmjs.com/package/@backstop/client)
@@ -20,9 +20,9 @@ Stop the next `DROP TABLE`. Approve before it runs. Restore in seconds if it get
 
 ## What is Backstop?
 
-Backstop sits between your AI agent and your PostgreSQL database. Every query passes through it. Risky writes — `DROP TABLE`, `DELETE FROM payments`, `TRUNCATE orders` — are intercepted, classified by risk level, checked against a live recovery point, and held for human approval before they touch production.
+Backstop sits between your AI agent and your PostgreSQL database. Queries routed through Backstop are intercepted, classified by risk level, checked against recovery readiness when needed, and held for human approval before risky writes touch production.
 
-If one slips through, the sidecar has already snapshotted the table. You restore in seconds.
+If one slips through, the sidecar has already snapshotted the table. You run the guided recovery CLI, restore into a recovered table, validate it, then copy back what you need.
 
 ```
 AI Agent  ──►  Backstop Gateway  ──►  PostgreSQL
@@ -34,7 +34,7 @@ AI Agent  ──►  Backstop Gateway  ──►  PostgreSQL
               └─────────────┘
 ```
 
-**Why it exists:** On April 27, 2026, a Cursor/Opus coding session deleted an entire production database in nine seconds. Backstop is the guardrail that prevents that class of failure — and restores you when it happens anyway.
+**Why it exists:** On April 27, 2026, a Cursor/Opus coding session deleted an entire production database in nine seconds. Backstop is the guardrail for routed PostgreSQL access: it blocks database-level destruction, gates table-level destruction on recovery readiness, and gives operators a practical restore path.
 
 ---
 
@@ -77,16 +77,32 @@ AI Agent  ──►  Backstop Gateway  ──►  PostgreSQL
 
 **Prerequisites:** Docker, Node.js 18+, Go 1.22+
 
-### 1 — Run the end-to-end drill
+### 1 — See the shortest local demo path
 
 ```bash
 git clone https://github.com/pratyush2514/Backstop.git
 cd Backstop
 npm install
+npm run demo
+```
+
+The demo command prints the local happy path, health URLs, and the exact E2E commands to prove the stack.
+
+### 2 — Run the end-to-end drill
+
+```bash
 npm run e2e
 ```
 
 The drill starts Postgres, MinIO, the sync sidecar, and the gateway. It seeds a small database, verifies snapshots, blocks `DROP DATABASE`, approves a `DROP TABLE`, restores the dropped table, and emits a JSON report.
+
+Run the PITR/WAL drill when validating full database recovery:
+
+```bash
+npm run e2e:pitr
+```
+
+This starts disposable Postgres and MinIO containers, archives real WAL, restores a physical base backup into a separate Postgres container, replays WAL, and validates the target recovery point.
 
 Windows:
 
@@ -94,7 +110,7 @@ Windows:
 powershell -ExecutionPolicy Bypass -File scripts\e2e.ps1
 ```
 
-### 2 — Install without cloning
+### 3 — Install without cloning
 
 **macOS / Linux**
 
@@ -242,13 +258,21 @@ safe_engine = backstop.protect_engine(
 **CLI:**
 
 ```bash
-backstop doctor                         # verify setup
-backstop up                             # start gateway + sidecar
-backstop snapshot --table users         # manual snapshot
-backstop restore --table users \
-  --snapshot-id snap_a3f9              # restore from snapshot
-backstop backup                         # logical backup of full schema
-backstop pitr-prepare                   # configure WAL archiving
+backstop doctor launch                  # launch readiness summary
+backstop doctor native-tools            # verify pg_dump, pg_restore, pg_basebackup
+backstop doctor storage-permissions \
+  --storage s3://my-bucket              # verify object storage permissions
+backstop recover --table users \
+  --db postgresql://localhost:5432/app \
+  --storage s3://my-bucket              # guided table recovery
+backstop backup logical-create \
+  --db postgresql://localhost:5432/app \
+  --storage s3://my-bucket              # full logical backup
+backstop pitr prepare-restore \
+  --storage s3://my-bucket \
+  --cluster-id prod \
+  --backup-id base_123 \
+  --target-dir ./restore-data           # prepare PITR files
 ```
 
 ---
@@ -260,16 +284,15 @@ Backstop uses PostgreSQL's own AST parser (not regex) to classify every query:
 | Level | Examples | Default behavior |
 |---|---|---|
 | `SAFE` | `SELECT`, `EXPLAIN` | Pass through |
-| `LOW` | `INSERT`, small `UPDATE` | Log and execute |
-| `HIGH` | `UPDATE` affecting many rows, `DELETE` with `WHERE` | Require approval |
+| `HIGH` | `INSERT`, scoped `UPDATE`, `DELETE` with `WHERE`, non-destructive DDL | Require approval |
 | `CRITICAL` | `DROP TABLE`, `TRUNCATE`, `ALTER TABLE DROP COLUMN` | Require approval + verified snapshot |
-| `IMPACT_CRITICAL` | Any write on a protected table/column | Block or escalate |
+| `IMPACT_CRITICAL` | High-impact writes or writes touching protected tables/columns | Require approval + recovery readiness when applicable |
 
 **Escalation rules** (configurable in `policy.json`):
 
 ```jsonc
 {
-  "require_approval_for_risks": ["HIGH", "CRITICAL"],
+  "require_approval_for_risks": ["HIGH", "IMPACT_CRITICAL", "CRITICAL"],
   "block_operations": ["DROP DATABASE", "DROP SCHEMA"],
   "require_recovery_for_critical": true,
   "max_snapshot_age_seconds": 300,
@@ -306,7 +329,7 @@ Approvals time out (default 5 min) and auto-deny. Every decision is written to t
 
 ## Snapshot & Recovery
 
-The **sync sidecar** snapshots tables to S3-compatible storage (MinIO for local, AWS S3 for production) in Parquet format every 60 seconds (configurable):
+The **sync sidecar** snapshots tables to S3-compatible storage (MinIO for local, AWS S3 for production) in Parquet format on a configurable interval. It captures every discovered table on startup by default, then captures new, changed, or retry-needed tables on later polls. `--snapshot-every-poll=true` keeps the older full-every-poll behavior.
 
 ```
 s3://bucket/backstop/
@@ -318,17 +341,18 @@ s3://bucket/backstop/
     snap_b7e2.manifest.json
 ```
 
-**Restore a dropped table:**
+**Guided restore of a dropped table:**
 
 ```bash
-backstop restore \
+backstop recover \
   --db postgresql://localhost:5432/app \
   --storage s3://prod-snapshots \
-  --snapshot-id snap_a3f9 \
   --table users
 ```
 
-The manifest contains the full `CREATE TABLE` DDL, foreign key constraints, indexes, and check constraints — so the table is reconstructed exactly.
+The wizard lists valid checksummed snapshots, restores into `users_recovered` by default, runs restore validation automatically, and prints copyback SQL only after validation passes. The lower-level `backstop restore`, `backstop restore-validate`, and `backstop restore-copyback-plan` commands remain available for automation.
+
+The manifest contains `CREATE TABLE` DDL plus captured indexes and constraints. Restore rebuilds a recovered target table from that manifest and row data, but table snapshots are not full-cluster PITR and some PostgreSQL objects live outside a single table.
 
 ---
 
@@ -402,6 +426,7 @@ cd sdk/python && python -m pytest tests -q
 
 # Full local E2E
 npm run e2e
+npm run e2e:pitr
 ```
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for PR expectations and the safety philosophy.

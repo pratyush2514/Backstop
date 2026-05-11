@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import psycopg2
 
 from backstop.restore import RestoreEngine
 from backstop.snapshot import SnapshotEngine
+from tests.conftest import DATABASE_URL
 
 pytestmark = pytest.mark.integration
 
@@ -352,10 +356,11 @@ class TestRestoreTable:
         )
         buf = io.BytesIO()
         pq.write_table(table, buf)
+        data = buf.getvalue()
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=data_key,
-            Body=buf.getvalue(),
+            Body=data,
             ContentType="application/octet-stream",
         )
 
@@ -384,6 +389,8 @@ class TestRestoreTable:
             "s3_bucket": S3_BUCKET,
             "s3_data_key": data_key,
             "s3_manifest_key": manifest_key,
+            "data_sha256": hashlib.sha256(data).hexdigest(),
+            "status": "valid",
         }
         s3_client.put_object(
             Bucket=S3_BUCKET,
@@ -408,4 +415,99 @@ class TestRestoreTable:
             (1, "Alice", "alice@example.com"),
             (2, "Bob", "bob@example.com"),
         ]
+
+    def test_restore_rejects_corrupt_snapshot_object(
+        self, pg_conn, s3_client, snap_engine, restore_engine, users_table
+    ) -> None:
+        """Restore must fail closed when the snapshot object checksum does not match."""
+        manifest = snap_engine.capture_table(
+            conn=pg_conn,
+            table="users",
+            query="DROP TABLE users",
+            operation="DROP TABLE",
+        )
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=manifest.s3_data_key,
+            Body=b"not the captured parquet",
+            ContentType="application/octet-stream",
+        )
+
+        with pytest.raises(RuntimeError, match="SHA256 mismatch"):
+            restore_engine.restore_table(
+                conn=pg_conn,
+                snapshot_id=manifest.snapshot_id,
+                table="users",
+            )
+
+        cur = pg_conn.cursor()
+        cur.execute("SELECT to_regclass('users_recovered')")
+        assert cur.fetchone()[0] is None
+
+    def test_restore_fails_closed_when_snapshot_object_is_missing(
+        self, pg_conn, s3_client, snap_engine, restore_engine, users_table
+    ) -> None:
+        """Restore-time object read failure must roll back the restore transaction."""
+        manifest = snap_engine.capture_table(
+            conn=pg_conn,
+            table="users",
+            query="DROP TABLE users",
+            operation="DROP TABLE",
+        )
+        s3_client.delete_object(Bucket=S3_BUCKET, Key=manifest.s3_data_key)
+
+        with pytest.raises(RuntimeError, match="Restore failed and was rolled back"):
+            restore_engine.restore_table(
+                conn=pg_conn,
+                snapshot_id=manifest.snapshot_id,
+                table="users",
+            )
+
+        cur = pg_conn.cursor()
+        cur.execute("SELECT to_regclass('users_recovered')")
+        assert cur.fetchone()[0] is None
+
+    def test_concurrent_restore_same_target_serializes_without_duplicates(
+        self, pg_conn, snap_engine, restore_engine, users_table
+    ) -> None:
+        """Concurrent restores into one target should be serialized by advisory lock."""
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS users_concurrent_restore CASCADE")
+        pg_conn.commit()
+
+        manifest = snap_engine.capture_table(
+            conn=pg_conn,
+            table="users",
+            query="DROP TABLE users",
+            operation="DROP TABLE",
+        )
+        pg_conn.commit()
+
+        def restore_once() -> int:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = False
+            try:
+                engine = RestoreEngine(s3_bucket=S3_BUCKET, endpoint_url=S3_ENDPOINT)
+                return engine.restore_table(
+                    conn=conn,
+                    snapshot_id=manifest.snapshot_id,
+                    table="users",
+                    target_table="users_concurrent_restore",
+                    conflict_policy="skip",
+                )
+            finally:
+                conn.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: restore_once(), range(2)))
+
+        try:
+            assert sorted(results) == [0, 5]
+            with pg_conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users_concurrent_restore")
+                assert cur.fetchone()[0] == 5
+        finally:
+            with pg_conn.cursor() as cur:
+                cur.execute("DROP TABLE IF EXISTS users_concurrent_restore CASCADE")
+            pg_conn.commit()
 

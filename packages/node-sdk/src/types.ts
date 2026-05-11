@@ -53,6 +53,23 @@ export interface ListSnapshotsOptions extends RequestOptions {
   table?: string;
 }
 
+export interface RestoreSnapshotOptions extends RequestOptions {
+  agentId?: string;
+  targetTable?: string;
+}
+
+export interface RestoreSnapshotPlan {
+  status: "restore_plan" | string;
+  snapshot_id: string;
+  source_table: string;
+  target_table: string;
+  restore_command: string;
+  message?: string;
+  environment?: string;
+  cluster_id?: string;
+  [key: string]: unknown;
+}
+
 export interface AuditOptions extends RequestOptions {
   agentId?: string;
   risk?: RiskLevel;

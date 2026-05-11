@@ -2,6 +2,16 @@
 
 ## Restore One Dropped Table
 
+Use the guided workflow first. It restores to `<table>_recovered`, validates the
+restore, and prints copyback SQL only after validation passes:
+
+```text
+backstop recover --db <postgres-url> --storage <s3-url> --table users
+```
+
+Use the lower-level commands when scripting or when an incident requires a
+specific snapshot ID.
+
 1. List snapshots:
 
 ```text
@@ -21,6 +31,12 @@ backstop restore --db <postgres-url> --storage <s3-url> --snapshot-id <snap-id> 
 ```
 
 4. Validate recovered table, then decide whether to copy data back or rename.
+
+5. Print copyback SQL after validation:
+
+```text
+backstop restore-copyback-plan --source-table users_recovered --target-table users
+```
 
 ## Restore Full Logical Database
 
@@ -117,13 +133,23 @@ Authorization: Bearer <gateway-token>
 
 ## Launch Validation Drill
 
-1. Check native tools:
+1. Run the launch readiness summary:
+
+```text
+backstop doctor launch --storage <s3-url> --table users --metadata-db /metadata/backstop.db
+```
+
+The verdict is `ready`, `degraded`, or `not_ready`. Treat `degraded` as a launch
+blocker for recovery-sensitive deployments unless every degraded item is
+understood and explicitly accepted.
+
+2. Check native tools:
 
 ```text
 backstop doctor native-tools --json
 ```
 
-2. Verify WAL storage round trip:
+3. Verify WAL storage round trip:
 
 ```text
 backstop drill wal-archive-fetch \
@@ -133,7 +159,7 @@ backstop drill wal-archive-fetch \
   --json
 ```
 
-3. Verify PITR restore preparation:
+4. Verify PITR restore preparation:
 
 ```text
 backstop drill pitr-prepare \
@@ -145,7 +171,16 @@ backstop drill pitr-prepare \
   --json
 ```
 
-4. Verify logical backup/restore against disposable databases:
+5. For the local OSS Docker path, verify real PostgreSQL PITR/WAL recovery:
+
+```text
+npm run e2e:pitr
+```
+
+This drill validates actual restore startup and WAL replay, not just file
+preparation. It must pass before claiming the local PITR path is launch-proven.
+
+6. Verify logical backup/restore against disposable databases:
 
 ```text
 backstop drill logical-backup-restore \

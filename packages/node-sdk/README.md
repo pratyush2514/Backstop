@@ -13,6 +13,15 @@ const backstop = await BackstopClient.local({
 const result = await backstop.query("SELECT count(*) FROM users");
 ```
 
+Operator/admin clients can also prepare a secret-safe restore plan:
+
+```ts
+const plan = await backstop.prepareRestoreSnapshot("snap_1234", "users");
+```
+
+The restore plan uses `BACKSTOP_RESTORE_DB`; Backstop never returns the raw
+database password to the SDK or MCP client.
+
 For local PostgreSQL development on `localhost` / `127.0.0.1`, the managed
 runtime automatically adds `sslmode=disable` if you did not specify an
 `sslmode` already. That avoids the common "SSL is not enabled on the server"

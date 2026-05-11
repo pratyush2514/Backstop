@@ -14,6 +14,7 @@ type sqlAnalysis struct {
 	Operation        string
 	Table            string
 	Schema           string
+	StatementCount   int
 	TableRecoverable bool
 	Reason           string
 	ParseError       error
@@ -31,7 +32,7 @@ func criticalRecoveryTable(query string) (string, error) {
 
 func analyzeSQL(query string) sqlAnalysis {
 	if strings.TrimSpace(query) == "" {
-		return criticalAnalysis("EMPTY", "", "", false, "empty SQL cannot be classified safely")
+		return safeAnalysis("EMPTY", "empty SQL is a validation no-op")
 	}
 
 	tree, err := pgquery.Parse(query)
@@ -46,7 +47,7 @@ func analyzeSQL(query string) sqlAnalysis {
 
 	statements := tree.GetStmts()
 	if len(statements) == 0 {
-		return criticalAnalysis("EMPTY", "", "", false, "no parseable SQL statements")
+		return safeAnalysis("EMPTY", "no parseable SQL statements")
 	}
 
 	var result sqlAnalysis
@@ -92,6 +93,7 @@ func analyzeSQL(query string) sqlAnalysis {
 		}
 	}
 
+	result.StatementCount = len(statements)
 	return result
 }
 
@@ -284,8 +286,6 @@ func riskRank(level string) int {
 		return 3
 	case RiskHigh:
 		return 2
-	case RiskLow:
-		return 1
 	default:
 		return 0
 	}

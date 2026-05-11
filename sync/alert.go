@@ -16,6 +16,7 @@ const alertHTTPTimeout = 5 * time.Second
 type AlertEngine struct {
 	webhookURL string
 	metadata   *MetadataStore
+	client     *http.Client
 }
 
 // NewAlertEngine creates an AlertEngine. If webhookURL is empty, alerts are
@@ -25,7 +26,7 @@ func NewAlertEngine(webhookURL string) *AlertEngine {
 }
 
 func NewAlertEngineWithMetadata(webhookURL string, metadata *MetadataStore) *AlertEngine {
-	return &AlertEngine{webhookURL: webhookURL, metadata: metadata}
+	return &AlertEngine{webhookURL: webhookURL, metadata: metadata, client: http.DefaultClient}
 }
 
 // webhookPayload is the JSON body posted to the webhook endpoint.
@@ -141,7 +142,11 @@ func (a *AlertEngine) sendPayload(ctx context.Context, payload webhookPayload) e
 		return fmt.Errorf("alert: failed to build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	client := a.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		status = "failed"
 		return fmt.Errorf("alert: HTTP request failed: %w", err)
@@ -159,6 +164,7 @@ func (a *AlertEngine) recordAlert(ctx context.Context, payload webhookPayload, s
 	if a == nil || a.metadata == nil {
 		return
 	}
-	a.metadata.RecordAlert(ctx, payload.Severity, payload.EventType, payload.Table, status, payload)
+	if err := a.metadata.RecordAlert(ctx, payload.Severity, payload.EventType, payload.Table, status, payload); err != nil {
+		slog.Error("Failed to record alert metadata", "event_type", payload.EventType, "table", payload.Table, "error", err)
+	}
 }
-

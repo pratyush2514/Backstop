@@ -26,7 +26,9 @@ func TestSnapshotManifestMatchesPhase2Contract(t *testing.T) {
 		S3Bucket:         "backstop-test",
 		S3DataKey:        "backstop/snapshots/users/snap_1234abcd/data.parquet",
 		S3ManifestKey:    "backstop/snapshots/users/snap_1234abcd/manifest.json",
+		DataSHA256:       strings.Repeat("a", 64),
 		SnapshotScope:    "table",
+		Status:           "valid",
 	}
 
 	raw, err := json.Marshal(manifest)
@@ -59,6 +61,8 @@ func TestSnapshotManifestMatchesPhase2Contract(t *testing.T) {
 		"s3_bucket",
 		"s3_data_key",
 		"s3_manifest_key",
+		"data_sha256",
+		"status",
 	}
 	for _, key := range required {
 		if _, ok := decoded[key]; !ok {
@@ -70,6 +74,27 @@ func TestSnapshotManifestMatchesPhase2Contract(t *testing.T) {
 	}
 	if decoded["operation"] != "SYNC_SNAPSHOT" {
 		t.Fatalf("operation = %v, want SYNC_SNAPSHOT", decoded["operation"])
+	}
+}
+
+func TestSnapshotManifestSupportsExplicitVerificationFreshness(t *testing.T) {
+	manifest := SnapshotManifest{
+		SnapshotID:    "snap_1234abcd",
+		TableName:     "users",
+		Timestamp:     "2026-05-01T00:00:00Z",
+		VerifiedAt:    "2026-05-01T00:01:00Z",
+		DataSHA256:    strings.Repeat("a", 64),
+		Status:        "valid",
+		S3DataKey:     "backstop/snapshots/users/snap_1234abcd/data.parquet",
+		S3Bucket:      "backstop-test",
+		SnapshotScope: "table",
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if !strings.Contains(string(raw), `"verified_at":"2026-05-01T00:01:00Z"`) {
+		t.Fatalf("manifest should expose verification freshness: %s", raw)
 	}
 }
 
@@ -115,4 +140,3 @@ func TestParquetSchemaUsesOptionalUTF8Columns(t *testing.T) {
 		}
 	}
 }
-

@@ -80,6 +80,7 @@ quarantine.
 backstop_execute_query
 backstop_analyze_query
 backstop_list_snapshots
+backstop_prepare_restore_snapshot
 backstop_get_safety_status
 backstop_get_pending_approvals
 backstop_get_audit_events
@@ -90,7 +91,7 @@ MCP mode profiles are controlled with `BACKSTOP_MCP_MODE`:
 
 ```bash
 BACKSTOP_MCP_MODE=agent     # execute/analyze/status, no approval tools
-BACKSTOP_MCP_MODE=operator  # approve/deny/audit/alerts, no SQL execution
+BACKSTOP_MCP_MODE=operator  # approve/deny/audit/alerts/restore plans, no SQL execution
 BACKSTOP_MCP_MODE=readonly  # analyze/status/audit/alerts, no mutation
 BACKSTOP_MCP_MODE=admin     # all tools, including emergency pause/resume
 ```
@@ -100,6 +101,7 @@ These approval tools are intentionally unavailable to autonomous `agent` mode:
 ```text
 backstop_approve_query
 backstop_deny_query
+backstop_prepare_restore_snapshot
 ```
 
 Enable only for trusted operator clients:
@@ -109,5 +111,7 @@ BACKSTOP_MCP_MODE=operator
 ```
 
 Autonomous agents should normally be able to request risky work, but not approve
-their own risky work.
+their own risky work or receive restore instructions. Restore plans are
+secret-safe: they use `BACKSTOP_RESTORE_DB` and never return the raw PostgreSQL
+connection string to the MCP client.
 

@@ -21,7 +21,7 @@ import tarfile
 import time
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 import click
@@ -162,6 +162,122 @@ def doctor_storage_permissions(storage: str, metadata_db: Optional[str], strict:
     _emit_drill_result(result, as_json)
     if not result["ok"]:
         sys.exit(1)
+
+
+@doctor.command("launch")
+@click.option("--db", default=None, help="Optional PostgreSQL URL for snapshot readiness checks")
+@click.option("--storage", default=None, help="Optional S3 storage URL for storage/snapshot checks")
+@click.option("--table", default=None, help="Optional table to require a valid snapshot for")
+@click.option("--metadata-db", default=None, help="Optional SQLite metadata DB path")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def doctor_launch(db: Optional[str], storage: Optional[str], table: Optional[str], metadata_db: Optional[str], as_json: bool) -> None:
+    """Summarize launch readiness in one operator-friendly check."""
+    checks: dict[str, Any] = {}
+    missing_tools = [tool for tool in ["pg_dump", "pg_restore", "pg_basebackup"] if shutil.which(tool) is None]
+    checks["native_tools"] = {"ok": not missing_tools, "missing": missing_tools}
+
+    if storage:
+        storage_result = _check_storage_permissions(storage, strict=False)
+        checks["storage_permissions"] = storage_result
+    else:
+        checks["storage_permissions"] = {"ok": None, "skipped": True, "reason": "pass --storage to check S3/MinIO access"}
+
+    if storage:
+        try:
+            bucket, endpoint_url = _parse_storage(storage)
+            snapshots = SnapshotEngine(s3_bucket=bucket, endpoint_url=endpoint_url).list_snapshots(table=table)
+            valid = [m for m in snapshots if m.status == "valid" and m.data_sha256]
+            checks["snapshot_readiness"] = {
+                "ok": bool(valid),
+                "valid_snapshots": len(valid),
+                "table": table,
+                "latest_snapshot": valid[0].snapshot_id if valid else None,
+            }
+        except Exception as exc:
+            checks["snapshot_readiness"] = {"ok": False, "error": str(exc), "table": table}
+    else:
+        checks["snapshot_readiness"] = {"ok": None, "skipped": True, "reason": "pass --storage to inspect snapshots"}
+
+    checks["metadata_health"] = _read_metadata_health(metadata_db)
+    checks["docker_drills"] = {
+        "ok": None,
+        "commands": ["npm run e2e", "npm run e2e:pitr"],
+        "note": "Run these local Docker drills before launch and after infrastructure changes.",
+    }
+    blocking = [name for name, detail in checks.items() if detail.get("ok") is False]
+    skipped = [name for name, detail in checks.items() if detail.get("ok") is None]
+    verdict = "ready" if not blocking and not skipped else "degraded" if not blocking else "not_ready"
+    payload = {"ok": verdict == "ready", "verdict": verdict, "checks": checks, "blocking": blocking, "skipped": skipped}
+    if as_json:
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    else:
+        _print_launch_doctor(payload)
+    if blocking:
+        sys.exit(1)
+
+
+def _check_storage_permissions(storage: str, strict: bool) -> dict[str, Any]:
+    cfg = parse_native_storage(storage)
+    key = f"{cfg.prefix}/doctor/permissions/{uuid4().hex}.txt"
+    payload = f"backstop storage doctor {uuid4().hex}\n".encode("utf-8")
+    result: dict[str, Any] = {
+        "ok": False,
+        "bucket": cfg.bucket,
+        "prefix": cfg.prefix,
+        "write_ok": False,
+        "read_ok": False,
+        "delete_allowed": None,
+        "strict": strict,
+        "warnings": [],
+    }
+    try:
+        store = S3ArtifactStore(cfg)
+        store.put_bytes(key, payload, "text/plain")
+        result["write_ok"] = True
+        result["read_ok"] = store.get_bytes(key) == payload
+        try:
+            store.delete_object(key)
+            result["delete_allowed"] = True
+            result["warnings"].append("DeleteObject is allowed for this credential. Prefer immutable/retention-backed storage in production.")
+        except Exception as exc:
+            result["delete_allowed"] = False
+            result["delete_error"] = str(exc)
+        result["ok"] = bool(result["write_ok"] and result["read_ok"] and not (strict and result["delete_allowed"]))
+    except Exception as exc:
+        result.update({"ok": False, "error": str(exc)})
+    return result
+
+
+def _read_metadata_health(metadata_db: Optional[str]) -> dict[str, Any]:
+    if not metadata_db:
+        return {"ok": None, "skipped": True, "reason": "pass --metadata-db to summarize recorded drill/health status"}
+    path = Path(metadata_db)
+    if not path.exists():
+        return {"ok": False, "error": f"metadata DB does not exist: {metadata_db}"}
+    store = MetadataStore(metadata_db)
+    try:
+        assert store.conn is not None
+        rows = store.conn.execute("SELECT component, status, checked_at, detail_json FROM health_checks ORDER BY component").fetchall()
+        health = {component: {"status": status, "checked_at": checked_at, "detail": json.loads(detail or "{}")} for component, status, checked_at, detail in rows}
+        return {"ok": all(item["status"] in {"ok", "healthy"} for item in health.values()) if health else None, "items": health}
+    finally:
+        store.close()
+
+
+def _print_launch_doctor(payload: dict[str, Any]) -> None:
+    verdict = payload["verdict"]
+    style = "green" if verdict == "ready" else "yellow" if verdict == "degraded" else "red"
+    console.print(Panel(f"[bold {style}]{verdict.upper()}[/bold {style}]", title="backstop Launch Doctor", border_style=style))
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Detail")
+    for name, detail in payload["checks"].items():
+        ok = detail.get("ok")
+        status = "PASS" if ok is True else "SKIP" if ok is None else "FAIL"
+        table.add_row(name, status, json.dumps({k: v for k, v in detail.items() if k != "ok"}, default=str)[:120])
+    console.print(table)
+    console.print("[dim]Next: run `npm run e2e` and `npm run e2e:pitr` for local Docker proof.[/dim]")
 
 
 @cli.group()
@@ -408,6 +524,190 @@ def list_snapshots(db: str, storage: str, table: Optional[str]) -> None:
     console.print(rich_table)
 
 
+# ── Guided recovery command ──────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--db", required=True, help="PostgreSQL connection URL")
+@click.option("--storage", required=True, help="S3 storage URL")
+@click.option("--type", "recovery_type", type=click.Choice(["table", "logical", "pitr"]), default="table", show_default=True)
+@click.option("--table", "table_name", default=None, help="Table to recover")
+@click.option("--snapshot-id", default=None, help="Snapshot ID to recover from")
+@click.option("--target-table", default=None, help="Safe restore target table (default: {table}_recovered)")
+@click.option("--conflict-policy", type=click.Choice(["skip", "overwrite", "fail"]), default="skip", show_default=True)
+@click.option("--yes", is_flag=True, help="Do not prompt before restoring")
+@click.option("--non-interactive", is_flag=True, help="Fail instead of prompting for missing choices")
+@click.option("--metadata-db", default=None, help="Optional SQLite metadata DB path")
+def recover(
+    db: str,
+    storage: str,
+    recovery_type: str,
+    table_name: Optional[str],
+    snapshot_id: Optional[str],
+    target_table: Optional[str],
+    conflict_policy: str,
+    yes: bool,
+    non_interactive: bool,
+    metadata_db: Optional[str],
+) -> None:
+    """Guided safe recovery workflow for operators."""
+    if recovery_type != "table":
+        _print_native_recovery_route(recovery_type)
+        return
+
+    if not table_name:
+        if non_interactive:
+            raise click.ClickException("--table is required in --non-interactive mode")
+        table_name = click.prompt("Table to recover")
+    target = target_table or f"{table_name}_recovered"
+    if target == table_name:
+        err_console.print(Panel("Refusing to restore over the original table. Use a recovered target table first.", title="[red]STOP[/red]", border_style="red"))
+        sys.exit(1)
+
+    bucket, endpoint_url = _parse_storage(storage)
+    engine = RestoreEngine(s3_bucket=bucket, endpoint_url=endpoint_url)
+    try:
+        manifest = _choose_recovery_snapshot(engine, table_name, snapshot_id, non_interactive)
+    except click.ClickException:
+        raise
+    except SystemExit:
+        raise
+    except Exception as exc:
+        err_console.print(
+            Panel(
+                f"Could not load a valid recovery point:\n{exc}\n\n"
+                "Check S3/MinIO credentials, endpoint URL, bucket name, and sidecar snapshot health.",
+                title="[red]STOP[/red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+    snapshot_id = manifest.snapshot_id
+
+    _print_recovery_snapshot_table([manifest], title="Selected recovery point")
+    preview_conn = None
+    try:
+        preview_conn = psycopg2.connect(db)
+        preview = engine.preview_restore(preview_conn, snapshot_id=snapshot_id, table=table_name, target_table=target)
+    except Exception as exc:
+        err_console.print(Panel(f"Could not preview restore:\n{exc}\n\nDB: {_scrub_url(db)}", title="[red]STOP[/red]", border_style="red"))
+        sys.exit(1)
+    finally:
+        if preview_conn is not None:
+            preview_conn.close()
+
+    console.print(
+        Panel(
+            f"Snapshot [green]{snapshot_id}[/green] will be restored into [cyan]{target}[/cyan].\n"
+            f"Rows in snapshot: [bold]{preview.row_count}[/bold]\n"
+            f"Target exists: [bold]{preview.target_exists}[/bold]\n"
+            f"Original table will not be overwritten.",
+            title="[cyan]SAFE TO CONTINUE[/cyan]",
+            border_style="cyan",
+        )
+    )
+    if not yes and not click.confirm("Restore and validate now?", default=False):
+        console.print("[yellow]Recovery cancelled. No database changes were made.[/yellow]")
+        return
+
+    conn = None
+    try:
+        conn = psycopg2.connect(db)
+        conn.autocommit = False
+        with console.status(f"[cyan]Restoring {table_name} -> {target}...[/cyan]"):
+            rows = engine.restore_table(
+                conn=conn,
+                snapshot_id=snapshot_id,
+                table=table_name,
+                target_table=target,
+                conflict_policy=conflict_policy,
+            )
+        validation = _validate_restore_payload(db, bucket, endpoint_url, snapshot_id, table_name, target)
+        store = MetadataStore(metadata_db)
+        store.record_restore_event(snapshot_id, table_name, target, "ok" if validation["ok"] else "failed", validation)
+        store.close()
+    except Exception as exc:
+        if conn is not None:
+            conn.close()
+        err_console.print(Panel(f"Recovery failed and unsafe copyback is blocked:\n{exc}", title="[red]STOP[/red]", border_style="red"))
+        sys.exit(1)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if not validation["ok"]:
+        _print_validation_result(validation)
+        err_console.print(Panel("Restore validation failed. Do not copy recovered rows back.", title="[red]VALIDATION FAILED[/red]", border_style="red"))
+        sys.exit(1)
+
+    _print_validation_result(validation)
+    console.print(
+        Panel(
+            f"Restore and validation passed.\nRows restored: [bold]{rows}[/bold]\nRecovered table: [cyan]{target}[/cyan]\n\n"
+            "Review the copyback plan below before running it manually.",
+            title="[green]RESTORE READY[/green]",
+            border_style="green",
+        )
+    )
+    console.print(Panel(_copyback_plan_sql(target, table_name, conflict_policy), title="[yellow]Copy-back plan[/yellow]", border_style="yellow"))
+
+
+def _choose_recovery_snapshot(engine: RestoreEngine, table_name: str, snapshot_id: Optional[str], non_interactive: bool):
+    if snapshot_id:
+        manifest = engine._snapshot_engine.get_manifest(snapshot_id=snapshot_id, table=table_name)
+        if manifest.status != "valid" or not manifest.data_sha256:
+            raise click.ClickException(f"snapshot {snapshot_id} is not a valid checksummed recovery point")
+        return manifest
+    snapshots = [
+        m for m in engine._snapshot_engine.list_snapshots(table=table_name)
+        if m.status == "valid" and m.data_sha256
+    ]
+    if not snapshots:
+        err_console.print(
+            Panel(
+                f"No valid checksummed snapshots were found for table [cyan]{table_name}[/cyan].\n\n"
+                "Next steps: check sync sidecar health, storage access, and whether this operation requires native PITR.",
+                title="[red]STOP[/red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+    if non_interactive:
+        return snapshots[0]
+    _print_recovery_snapshot_table(snapshots[:10], title="Available valid snapshots")
+    selected = click.prompt("Select snapshot number", type=click.IntRange(1, min(len(snapshots), 10)), default=1)
+    return snapshots[selected - 1]
+
+
+def _print_recovery_snapshot_table(manifests: list[Any], title: str) -> None:
+    table = Table(title=title, show_header=True, header_style="bold cyan")
+    table.add_column("#", justify="right")
+    table.add_column("Snapshot ID", style="green")
+    table.add_column("Table", style="cyan")
+    table.add_column("Rows", justify="right")
+    table.add_column("Status")
+    table.add_column("Timestamp")
+    for idx, manifest in enumerate(manifests, start=1):
+        table.add_row(str(idx), manifest.snapshot_id, manifest.table_name, str(manifest.row_count), manifest.status, manifest.timestamp)
+    console.print(table)
+
+
+def _print_native_recovery_route(recovery_type: str) -> None:
+    if recovery_type == "pitr":
+        body = (
+            "Use PostgreSQL-native PITR for database-level recovery.\n\n"
+            "1. Verify WAL fetch: backstop drill wal-archive-fetch --storage <s3-url> --cluster-id <cluster>\n"
+            "2. Prepare restore: backstop pitr prepare-restore --storage <s3-url> --cluster-id <cluster> --backup-id <id> --target-dir <dir>\n"
+            "3. For local proof: npm run e2e:pitr"
+        )
+    else:
+        body = (
+            "Use logical backup restore for full logical database recovery.\n\n"
+            "1. Create: backstop backup logical-create --db <source-db> --storage <s3-url>\n"
+            "2. Restore: backstop backup logical-restore --db <target-db> --storage <s3-url> --backup-id <id>"
+        )
+    console.print(Panel(body, title="[yellow]Native recovery path[/yellow]", border_style="yellow"))
+
+
 # ── Restore command ───────────────────────────────────────────────────────────
 
 @cli.command()
@@ -579,31 +879,10 @@ def restore_validate(db: str, storage: str, snapshot_id: str, table: str, target
     """Validate a restored table against its snapshot manifest."""
     bucket, endpoint_url = _parse_storage(storage)
     target = target_table or f"{table}_recovered"
-    payload = {"ok": False, "snapshot_id": snapshot_id, "source_table": table, "target_table": target}
     try:
-        engine = RestoreEngine(s3_bucket=bucket, endpoint_url=endpoint_url)
-        manifest = engine._snapshot_engine.get_manifest(snapshot_id=snapshot_id, table=table)
-        with psycopg2.connect(db) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = %s)", (target,))
-                target_exists = bool(cur.fetchone()[0])
-                row_count = None
-                if target_exists:
-                    from psycopg2 import sql as pgsql
-                    cur.execute(pgsql.SQL("SELECT COUNT(*) FROM {}").format(pgsql.Identifier(target)))
-                    row_count = int(cur.fetchone()[0])
-        payload.update(
-            {
-                "ok": target_exists and row_count == manifest.row_count,
-                "target_exists": target_exists,
-                "target_row_count": row_count,
-                "manifest_row_count": manifest.row_count,
-                "indexes": len(getattr(manifest, "indexes", [])),
-                "constraints": len(manifest.fk_constraints) + len(getattr(manifest, "check_constraints", [])),
-            }
-        )
+        payload = _validate_restore_payload(db, bucket, endpoint_url, snapshot_id, table, target)
     except Exception as exc:
-        payload.update({"ok": False, "error": str(exc)})
+        payload = {"ok": False, "snapshot_id": snapshot_id, "source_table": table, "target_table": target, "error": str(exc)}
     store = MetadataStore(metadata_db)
     store.record_restore_event(snapshot_id, table, target, "ok" if payload["ok"] else "failed", payload)
     store.close()
@@ -612,12 +891,125 @@ def restore_validate(db: str, storage: str, snapshot_id: str, table: str, target
         sys.exit(1)
 
 
+def _validate_restore_payload(db: str, bucket: str, endpoint_url: Optional[str], snapshot_id: str, table: str, target: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {"ok": False, "snapshot_id": snapshot_id, "source_table": table, "target_table": target}
+    engine = RestoreEngine(s3_bucket=bucket, endpoint_url=endpoint_url)
+    manifest = engine._snapshot_engine.get_manifest(snapshot_id=snapshot_id, table=table)
+    schema_name = manifest.schema_name or "public"
+    expected_indexes = len(getattr(manifest, "indexes", []))
+    expected_constraints = len(manifest.fk_constraints) + len(getattr(manifest, "check_constraints", []))
+    sample_rows = _sample_snapshot_rows(engine, manifest, limit=50)
+    with psycopg2.connect(db) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = %s AND table_name = %s)", (schema_name, target))
+            target_exists = bool(cur.fetchone()[0])
+            row_count = None
+            actual_indexes = 0
+            actual_constraints = 0
+            invalid_constraints: list[str] = []
+            sample_mismatches: list[dict[str, Any]] = []
+            if target_exists:
+                from psycopg2 import sql as pgsql
+
+                cur.execute(pgsql.SQL("SELECT COUNT(*) FROM {}").format(pgsql.Identifier(schema_name, target)))
+                row_count = int(cur.fetchone()[0])
+                cur.execute("SELECT COUNT(*) FROM pg_indexes WHERE schemaname = %s AND tablename = %s", (schema_name, target))
+                actual_indexes = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    SELECT conname
+                    FROM pg_constraint
+                    WHERE conrelid = %s::regclass
+                      AND NOT convalidated
+                    ORDER BY conname
+                    """,
+                    (f"{schema_name}.{target}",),
+                )
+                invalid_constraints = [row[0] for row in cur.fetchall()]
+                cur.execute("SELECT COUNT(*) FROM pg_constraint WHERE conrelid = %s::regclass", (f"{schema_name}.{target}",))
+                actual_constraints = int(cur.fetchone()[0])
+                sample_mismatches = _restore_sample_mismatches(cur, schema_name, target, sample_rows)
+    checks = {
+        "target_exists": target_exists,
+        "row_count": target_exists and row_count == manifest.row_count,
+        "indexes": actual_indexes >= expected_indexes,
+        "constraints": actual_constraints >= expected_constraints and not invalid_constraints,
+        "sample_equality": not sample_mismatches,
+    }
+    payload.update(
+        {
+            "ok": all(checks.values()),
+            "checks": checks,
+            "target_exists": target_exists,
+            "target_row_count": row_count,
+            "manifest_row_count": manifest.row_count,
+            "expected_indexes": expected_indexes,
+            "actual_indexes": actual_indexes,
+            "expected_constraints": expected_constraints,
+            "actual_constraints": actual_constraints,
+            "invalid_constraints": invalid_constraints,
+            "sample_checked": len(sample_rows),
+            "sample_mismatches": sample_mismatches[:5],
+        }
+    )
+    return payload
+
+
+def _print_validation_result(payload: dict[str, Any]) -> None:
+    checks = payload.get("checks", {})
+    table = Table(title="Restore validation", show_header=True, header_style="bold cyan")
+    table.add_column("Check")
+    table.add_column("Result")
+    for name, passed in checks.items():
+        table.add_row(name, "[green]PASS[/green]" if passed else "[red]FAIL[/red]")
+    console.print(table)
+
+
+def _sample_snapshot_rows(engine: RestoreEngine, manifest: Any, limit: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for batch in engine._iter_parquet_row_batches(manifest):
+        for row in batch:
+            rows.append(row)
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def _restore_sample_mismatches(cur: Any, schema_name: str, target: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from psycopg2 import sql as pgsql
+
+    mismatches: list[dict[str, Any]] = []
+    if not rows:
+        return mismatches
+    columns = list(rows[0].keys())
+    for row in rows:
+        predicates = pgsql.SQL(" AND ").join(
+            pgsql.SQL("{col} IS NOT DISTINCT FROM {value}").format(
+                col=pgsql.Identifier(column),
+                value=pgsql.Literal(row[column]),
+            )
+            for column in columns
+        )
+        query = pgsql.SQL("SELECT 1 FROM {table} WHERE {predicates} LIMIT 1").format(
+            table=pgsql.Identifier(schema_name, target),
+            predicates=predicates,
+        )
+        cur.execute(query)
+        if cur.fetchone() is None:
+            mismatches.append({key: row.get(key) for key in columns[:5]})
+    return mismatches
+
+
 @cli.command("restore-copyback-plan")
 @click.option("--source-table", required=True, help="Restored table, usually {table}_recovered")
 @click.option("--target-table", required=True, help="Original table to repair")
 @click.option("--conflict-policy", type=click.Choice(["skip", "overwrite", "fail"]), default="skip", show_default=True)
 def restore_copyback_plan(source_table: str, target_table: str, conflict_policy: str) -> None:
     """Print operator-reviewed SQL for copying recovered rows back."""
+    console.print(Panel(_copyback_plan_sql(source_table, target_table, conflict_policy), title="[yellow]Copy-back plan[/yellow]", border_style="yellow"))
+
+
+def _copyback_plan_sql(source_table: str, target_table: str, conflict_policy: str) -> str:
     if conflict_policy == "fail":
         insert = f'INSERT INTO "{target_table}" SELECT * FROM "{source_table}";'
     elif conflict_policy == "overwrite":
@@ -628,13 +1020,9 @@ def restore_copyback_plan(source_table: str, target_table: str, conflict_policy:
         )
     else:
         insert = f'INSERT INTO "{target_table}" SELECT * FROM "{source_table}" ON CONFLICT DO NOTHING;'
-    console.print(
-        Panel(
-            f"-- Review locks, triggers, FKs, and application downtime before running.\n"
-            f"BEGIN;\nLOCK TABLE \"{target_table}\" IN SHARE ROW EXCLUSIVE MODE;\n{insert}\nCOMMIT;",
-            title="[yellow]Copy-back plan[/yellow]",
-            border_style="yellow",
-        )
+    return (
+        f"-- Review locks, triggers, FKs, and application downtime before running.\n"
+        f"BEGIN;\nLOCK TABLE \"{target_table}\" IN SHARE ROW EXCLUSIVE MODE;\n{insert}\nCOMMIT;"
     )
 
 
@@ -928,4 +1316,8 @@ def wal_fetch(storage: str, cluster_id: str, wal_name: str, output: str) -> None
         err_console.print(Panel(f"[red]WAL fetch failed:[/red]\n{exc}", title="[red]Error[/red]", border_style="red"))
         sys.exit(1)
     console.print(f"[green]Fetched WAL[/green] [cyan]{key}[/cyan] -> [cyan]{output}[/cyan]")
+
+
+if __name__ == "__main__":
+    cli()
 

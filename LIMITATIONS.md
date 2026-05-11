@@ -27,11 +27,22 @@ Table snapshots cannot recover:
 Full database recovery requires PostgreSQL-native logical backups or PITR with
 base backups and WAL archiving configured before the incident.
 
+For the local OSS path, run `npm run e2e:pitr` to prove the base-backup plus
+WAL replay flow end to end. Passing that drill proves the local drill path, not
+that every production deployment is protected. Production PITR is only trusted
+after the target environment has passed its own archive, fetch, restore, and
+validation drill.
+
 ## Table Snapshot Consistency
 
 Table snapshots are useful for fast table recovery, but they are not the same as
 transactionally consistent PITR. Multi-table operations, cascades, foreign keys,
 and schema changes may require recovery groups or native PITR.
+
+The guided `backstop recover` command intentionally restores table snapshots to
+`<table>_recovered` by default and prints copyback SQL only after validation
+passes. That protects the normal operator path, but it does not change the
+underlying consistency boundary: snapshots are table-level recovery points.
 
 ## Semantic SQL Risk
 
@@ -49,4 +60,3 @@ eventually use a central metadata backend.
 
 The current implementation is PostgreSQL-first. MySQL support would require a
 separate parser, backup model, restore model, and safety policy implementation.
-

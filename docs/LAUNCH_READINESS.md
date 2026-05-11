@@ -195,12 +195,16 @@ agent-like roles connect outside the expected gateway path.
 Run these before launch and after infrastructure changes:
 
 ```text
+backstop doctor launch --storage <s3-url> --table <table> --metadata-db /metadata/backstop.db
 backstop doctor native-tools --json
 backstop doctor storage-permissions --storage <s3-url> --strict --json
 backstop drill wal-archive-fetch --storage <s3-url> --cluster-id prod --json
 backstop drill pitr-prepare --storage <s3-url> --cluster-id prod --target-dir <dir> --simulate --json
 backstop drill logical-backup-restore --source-db <url> --target-db <url> --storage <s3-url> --json
 ```
+
+`backstop doctor launch` is the operator-friendly summary. Use the drill
+commands as the deterministic proof behind the verdict and in CI.
 
 Pass `--metadata-db /metadata/backstop.db` to persist drill health and native
 backup manifests.
@@ -210,6 +214,17 @@ For a local OSS E2E drill:
 ```bash
 npm run e2e
 ```
+
+For the full local PostgreSQL PITR/WAL drill:
+
+```bash
+npm run e2e:pitr
+```
+
+This starts a disposable source PostgreSQL and MinIO stack, takes a real
+`pg_basebackup`, writes before/after target markers, restores the base backup
+into a separate PostgreSQL container, replays WAL through `backstop wal fetch`,
+and validates that only the before-target marker exists.
 
 or:
 

@@ -52,4 +52,3 @@ func TestParseStorageRejectsInvalidInput(t *testing.T) {
 		}
 	}
 }
-

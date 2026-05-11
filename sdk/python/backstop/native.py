@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 
 DEFAULT_PREFIX = "backstop"
-WAL_NAME_RE = re.compile(r"^[A-Fa-f0-9]{24}(?:\.[A-Za-z0-9._-]+)?$")
+WAL_NAME_RE = re.compile(r"^(?:[A-Fa-f0-9]{24}(?:\.[A-Za-z0-9._-]+)?|[A-Fa-f0-9]{8}\.history)$")
 
 
 @dataclass(frozen=True)

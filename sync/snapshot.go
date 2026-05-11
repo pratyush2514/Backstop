@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -46,6 +47,9 @@ type SnapshotManifest struct {
 	S3ManifestKey    string   `json:"s3_manifest_key"`
 	DataSHA256       string   `json:"data_sha256"`
 	SnapshotScope    string   `json:"snapshot_scope"`
+	Status           string   `json:"status"`
+	ValidationError  string   `json:"validation_error,omitempty"`
+	VerifiedAt       string   `json:"verified_at,omitempty"`
 	SourceSelectSQL  *string  `json:"source_select_sql"`
 }
 
@@ -60,7 +64,9 @@ type SnapshotEngine struct {
 	dbName       string
 	schema       string
 	maxTableRows int
+	mu           sync.RWMutex
 	latest       map[string]SnapshotManifest
+	tableLocks   sync.Map // map[string]*sync.Mutex — per-table capture serialization
 }
 
 func NewSnapshotEngine(db *sql.DB, s3Client *s3.Client, storage StorageConfig, dbName string, schema string, maxTableRows int) *SnapshotEngine {
@@ -75,50 +81,131 @@ func NewSnapshotEngine(db *sql.DB, s3Client *s3.Client, storage StorageConfig, d
 	}
 }
 
+// tableCaptureLock returns the mutex for serializing captures of a specific table.
+// Different tables use independent locks so they can be captured concurrently.
+func (e *SnapshotEngine) tableCaptureLock(table string) *sync.Mutex {
+	v, _ := e.tableLocks.LoadOrStore(table, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// cleanupOrphanedData removes a data object from S3 after a failed snapshot.
+// Uses a detached context because the original request context may be cancelled.
+func (e *SnapshotEngine) cleanupOrphanedData(dataKey, snapshotID string) {
+	cleanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := e.s3.DeleteObject(cleanCtx, &s3.DeleteObjectInput{
+		Bucket: aws.String(e.storage.Bucket),
+		Key:    aws.String(dataKey),
+	})
+	if err != nil {
+		slog.Warn("Failed to clean up orphaned snapshot data",
+			"key", dataKey, "snapshot_id", snapshotID, "error", err)
+	} else {
+		slog.Info("Cleaned up orphaned snapshot data",
+			"key", dataKey, "snapshot_id", snapshotID)
+	}
+}
+
 func (e *SnapshotEngine) Latest(table string) (SnapshotManifest, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	manifest, ok := e.latest[table]
 	return manifest, ok
 }
 
+func (e *SnapshotEngine) VerifyLatest(ctx context.Context, table string) (SnapshotManifest, error) {
+	tableMu := e.tableCaptureLock(table)
+	tableMu.Lock()
+	defer tableMu.Unlock()
+
+	e.mu.RLock()
+	manifest, ok := e.latest[table]
+	e.mu.RUnlock()
+	if !ok {
+		return SnapshotManifest{}, fmt.Errorf("no latest snapshot for table %s", table)
+	}
+	if manifest.Status != "valid" || manifest.DataSHA256 == "" {
+		return SnapshotManifest{}, fmt.Errorf("latest snapshot for table %s is not verifiable: status=%q sha256_present=%t", table, manifest.Status, manifest.DataSHA256 != "")
+	}
+	if err := e.verifyUploadedDataObject(ctx, manifest.S3DataKey, manifest.DataSHA256); err != nil {
+		return SnapshotManifest{}, err
+	}
+	manifest.VerifiedAt = time.Now().UTC().Format(time.RFC3339)
+	e.mu.Lock()
+	e.latest[table] = manifest
+	e.mu.Unlock()
+	slog.Debug("Snapshot verification refreshed", "table", table, "snapshot_id", manifest.SnapshotID, "verified_at", manifest.VerifiedAt)
+	return manifest, nil
+}
+
 func (e *SnapshotEngine) CaptureTable(ctx context.Context, table string) (SnapshotManifest, error) {
+	// Acquire per-table lock. This serializes captures of the same table while
+	// allowing different tables to be captured concurrently. The lock prevents
+	// duplicate uploads and race conditions on the latest map if CaptureTable
+	// is ever called from multiple goroutines (defense-in-depth).
+	tableMu := e.tableCaptureLock(table)
+	tableMu.Lock()
+	defer tableMu.Unlock()
+
 	snapshotID := generateSnapshotID()
 	tableKey := safeTableKey(table)
 	baseKey := fmt.Sprintf("%s/snapshots/%s/%s", e.storage.Prefix, tableKey, snapshotID)
 	dataKey := baseKey + "/data.parquet"
 	manifestKey := baseKey + "/manifest.json"
 
+	slog.Info("Snapshot capture starting",
+		"table", table, "snapshot_id", snapshotID, "phase", "schema_capture")
+
+	// Phase 1: Capture schema metadata from PostgreSQL.
+	// These are read-only queries against information_schema/pg_catalog.
 	schemaDDL, err := e.tableDDL(ctx, table)
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("capture schema DDL for %s: %w", table, err)
 	}
 	fks, err := e.fkConstraints(ctx, table)
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("capture FK constraints for %s: %w", table, err)
 	}
 	checks, err := e.checkConstraints(ctx, table)
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("capture CHECK constraints for %s: %w", table, err)
 	}
 	indexes, err := e.indexes(ctx, table)
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("capture indexes for %s: %w", table, err)
 	}
+
+	// Phase 2: Write table data to local Parquet temp file and compute SHA256.
+	// The Parquet file is the snapshot's data payload; the SHA256 is its integrity seal.
+	slog.Info("Snapshot writing parquet",
+		"table", table, "snapshot_id", snapshotID, "phase", "parquet_write")
 
 	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("backstop-%s.parquet", snapshotID))
 	rowCount, err := e.writeTableParquet(ctx, table, tmpPath)
 	if err != nil {
 		_ = os.Remove(tmpPath)
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("write parquet for %s: %w", table, err)
 	}
 	defer os.Remove(tmpPath)
+
 	dataHash, err := fileSHA256(tmpPath)
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("hash parquet for %s: %w", table, err)
 	}
+	if strings.TrimSpace(dataHash) == "" {
+		return SnapshotManifest{}, fmt.Errorf("computed empty SHA256 for snapshot data of %s", table)
+	}
+
+	// Phase 3: Upload data object to S3.
+	// S3 PutObject is atomic for single-part uploads — the object is either
+	// fully written or not visible. The risk is cross-object inconsistency:
+	// data uploaded but manifest not yet written.
+	slog.Info("Snapshot uploading data",
+		"table", table, "snapshot_id", snapshotID, "rows", rowCount, "phase", "s3_upload")
 
 	file, err := os.Open(tmpPath)
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("open parquet for upload: %w", err)
 	}
 	defer file.Close()
 
@@ -129,9 +216,25 @@ func (e *SnapshotEngine) CaptureTable(ctx context.Context, table string) (Snapsh
 		ContentType: aws.String("application/octet-stream"),
 	})
 	if err != nil {
-		return SnapshotManifest{}, err
+		return SnapshotManifest{}, fmt.Errorf("upload parquet to S3 for %s: %w", table, err)
 	}
 
+	// Phase 4: Verify uploaded data integrity by re-reading from S3.
+	// This catches S3 transport corruption and ensures the stored object
+	// matches the locally computed SHA256.
+	slog.Info("Snapshot verifying upload",
+		"table", table, "snapshot_id", snapshotID, "phase", "s3_verify")
+
+	if err := e.verifyUploadedDataObject(ctx, dataKey, dataHash); err != nil {
+		e.cleanupOrphanedData(dataKey, snapshotID)
+		return SnapshotManifest{}, fmt.Errorf("verify uploaded data for %s: %w", table, err)
+	}
+
+	// Phase 5: Write manifest to S3.
+	// The manifest is the authoritative record of this snapshot. Without a
+	// manifest, the data object is invisible to the system (readers scan for
+	// manifest.json files). Status is set to "valid" only after data integrity
+	// has been verified.
 	manifest := SnapshotManifest{
 		ManifestVersion:  1,
 		Writer:           sidecarWriter,
@@ -153,12 +256,15 @@ func (e *SnapshotEngine) CaptureTable(ctx context.Context, table string) (Snapsh
 		S3ManifestKey:    manifestKey,
 		DataSHA256:       dataHash,
 		SnapshotScope:    "table",
+		Status:           "valid",
+		VerifiedAt:       time.Now().UTC().Format(time.RFC3339),
 		SourceSelectSQL:  nil,
 	}
 
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		return SnapshotManifest{}, err
+		e.cleanupOrphanedData(dataKey, snapshotID)
+		return SnapshotManifest{}, fmt.Errorf("marshal manifest for %s: %w", table, err)
 	}
 	_, err = e.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(e.storage.Bucket),
@@ -167,12 +273,45 @@ func (e *SnapshotEngine) CaptureTable(ctx context.Context, table string) (Snapsh
 		ContentType: aws.String("application/json"),
 	})
 	if err != nil {
-		return SnapshotManifest{}, err
+		// Data object uploaded but manifest failed. Clean up the orphaned data
+		// so it doesn't accumulate in S3 with no manifest referencing it.
+		e.cleanupOrphanedData(dataKey, snapshotID)
+		return SnapshotManifest{}, fmt.Errorf("upload manifest to S3 for %s: %w", table, err)
 	}
 
+	// Phase 6: Update in-memory latest map. This is the final step; the
+	// snapshot is now fully committed to S3 and visible to readers.
+	e.mu.Lock()
 	e.latest[table] = manifest
-	slog.Info("Snapshot complete", "table", table, "snapshot_id", snapshotID, "rows", rowCount, "manifest", manifestKey)
+	e.mu.Unlock()
+
+	slog.Info("Snapshot complete",
+		"table", table, "snapshot_id", snapshotID, "rows", rowCount,
+		"manifest", manifestKey, "data_sha256", dataHash, "phase", "complete")
 	return manifest, nil
+}
+
+func (e *SnapshotEngine) verifyUploadedDataObject(ctx context.Context, key string, wantSHA256 string) error {
+	if strings.TrimSpace(wantSHA256) == "" {
+		return fmt.Errorf("snapshot data object %s has no expected sha256", key)
+	}
+	resp, err := e.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(e.storage.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("verify uploaded snapshot object %s: %w", key, err)
+	}
+	defer resp.Body.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, resp.Body); err != nil {
+		return fmt.Errorf("hash uploaded snapshot object %s: %w", key, err)
+	}
+	got := hex.EncodeToString(hash.Sum(nil))
+	if !strings.EqualFold(got, wantSHA256) {
+		return fmt.Errorf("uploaded snapshot object %s sha256 mismatch: got %s want %s", key, got, wantSHA256)
+	}
+	return nil
 }
 
 func fileSHA256(path string) (string, error) {
@@ -455,9 +594,9 @@ func pgColType(dataType string, charLen, precision, scale sql.NullInt64) string 
 }
 
 func generateSnapshotID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("snap_%x", time.Now().UnixNano())[:13]
+		return fmt.Sprintf("snap_%x", time.Now().UnixNano())
 	}
 	return "snap_" + hex.EncodeToString(b)
 }
@@ -470,4 +609,3 @@ func safeTableKey(table string) string {
 func quoteIdent(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
-

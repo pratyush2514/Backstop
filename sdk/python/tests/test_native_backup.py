@@ -170,3 +170,12 @@ def test_wal_rejects_bad_name(local_tmp, moto_s3) -> None:
     with pytest.raises(ValueError):
         WALArchive(STORAGE, cluster_id="cluster-a").archive(str(wal_file), "../bad")
 
+
+def test_wal_accepts_postgres_timeline_history_file(local_tmp, moto_s3) -> None:
+    wal_file = local_tmp / "00000002.history"
+    wal_file.write_bytes(b"1\t0/5000000\tno recovery target specified\n")
+
+    key = WALArchive(STORAGE, cluster_id="cluster-a").archive(str(wal_file), wal_file.name)
+
+    assert key == "backstop/wal/cluster-a/00000002.history"
+

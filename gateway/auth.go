@@ -175,4 +175,3 @@ func legacyValidAuthToken(r *http.Request, token string) bool {
 func constantTimeEqual(candidate, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) == 1
 }
-

@@ -1,22 +1,20 @@
 param(
   [string]$ComposeFile = "deploy\docker-compose.yml",
-  [string]$Project = "backstop_oss_e2e",
-  [string]$Token = "dev-token",
-  [int]$TimeoutSeconds = 180,
-  [int]$GatewayPort = 8080,
-  [int]$PostgresPort = 5433,
-  [int]$MinioPort = 9000,
-  [int]$MinioConsolePort = 9001,
-  [int]$SyncPort = 9091
+  [string]$Project = "backstop_pitr_e2e",
+  [int]$TimeoutSeconds = 360,
+  [int]$GatewayPort = 18088,
+  [int]$PostgresPort = 15441,
+  [int]$MinioPort = 19010,
+  [int]$MinioConsolePort = 19011,
+  [int]$SyncPort = 19099
 )
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $root
 
-node scripts/e2e.mjs `
+node scripts/pitr-e2e.mjs `
   --compose-file $ComposeFile `
   --project $Project `
-  --token $Token `
   --timeout-seconds $TimeoutSeconds `
   --gateway-port $GatewayPort `
   --postgres-port $PostgresPort `
