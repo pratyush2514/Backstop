@@ -1,0 +1,25 @@
+{
+  "name": "backstop-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @backstop/client && npm run build --workspace @backstop/mcp-server",
+    "demo": "node scripts/demo.mjs",
+    "e2e": "node scripts/e2e.mjs",
+    "e2e:pitr": "node scripts/pitr-e2e.mjs",
+    "test": "npm run test --workspace @backstop/client && npm run test --workspace @backstop/mcp-server",
+    "pack:check": "npm pack --workspace @backstop/client --dry-run && npm pack --workspace @backstop/mcp-server --dry-run",
+    "e2e:build": "powershell -ExecutionPolicy Bypass -File scripts/e2e-build.ps1",
+    "e2e:up": "powershell -ExecutionPolicy Bypass -File scripts/e2e-up.ps1",
+    "node:test": "npm run test --workspace @backstop/client",
+    "mcp:test": "npm run test --workspace @backstop/mcp-server"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
+

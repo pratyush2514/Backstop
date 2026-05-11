@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "backstop": {
+      "command": "npx",
+      "args": ["@backstop/mcp-server"],
+      "env": {
+        "BACKSTOP_URL": "http://localhost:8080",
+        "BACKSTOP_TOKEN": "dev-token",
+        "BACKSTOP_AGENT_ID": "local-ai-agent"
+      }
+    }
+  }
+}
+

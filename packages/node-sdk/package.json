@@ -1,0 +1,50 @@
+{
+  "name": "@backstop/client",
+  "version": "0.1.0-alpha.2",
+  "description": "TypeScript/Node client for the backstop gateway.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/pratyush2514/Backstop",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pratyush2514/Backstop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pratyush2514/Backstop/issues"
+  },
+  "keywords": [
+    "backstop",
+    "postgres",
+    "postgresql",
+    "ai-agent",
+    "database-safety",
+    "mcp"
+  ],
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.909.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node test/client.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+

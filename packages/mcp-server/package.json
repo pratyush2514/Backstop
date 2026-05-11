@@ -1,0 +1,55 @@
+{
+  "name": "@backstop/mcp-server",
+  "version": "0.1.0-alpha.2",
+  "description": "MCP server for safe AI-agent database access through backstop.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/pratyush2514/Backstop",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pratyush2514/Backstop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pratyush2514/Backstop/issues"
+  },
+  "keywords": [
+    "backstop",
+    "mcp",
+    "model-context-protocol",
+    "postgres",
+    "postgresql",
+    "ai-agent",
+    "database-safety"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "backstop-mcp": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @backstop/client && tsc -p tsconfig.json",
+    "test": "npm run build && node test/config.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@backstop/client": "0.1.0-alpha.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+

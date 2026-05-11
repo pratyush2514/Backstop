@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "backstop-operator": {
+      "command": "npx",
+      "args": ["@backstop/mcp-server"],
+      "env": {
+        "BACKSTOP_URL": "http://localhost:8080",
+        "BACKSTOP_TOKEN": "dev-token",
+        "BACKSTOP_AGENT_ID": "operator-mcp-client",
+        "BACKSTOP_MCP_ENABLE_APPROVAL_TOOLS": "true"
+      }
+    }
+  }
+}
+
